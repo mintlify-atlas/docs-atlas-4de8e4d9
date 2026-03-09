@@ -1,0 +1,168 @@
+{
+  "projectType": "saas",
+  "projectName": "identiPay",
+  "projectDescription": "Privacy-preserving payment protocol with cardless transactions powered by verified digital identity and zero-knowledge proofs.",
+  "theme": "aspen",
+  "primaryColor": "#040404",
+  "lightColor": null,
+  "darkColor": null,
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/intent-based-payments",
+              "concepts/stealth-addresses",
+              "concepts/shielded-pools",
+              "concepts/zero-knowledge-proofs"
+            ]
+          },
+          {
+            "group": "Use Cases",
+            "pages": [
+              "use-cases/merchant-payments",
+              "use-cases/age-verification",
+              "use-cases/privacy-protection"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Integration",
+        "groups": [
+          {
+            "group": "Merchant Integration",
+            "pages": [
+              "integration/merchant-overview",
+              "integration/checkout-integration",
+              "integration/payment-flow",
+              "integration/webhooks"
+            ]
+          },
+          {
+            "group": "Mobile Applications",
+            "pages": [
+              "integration/wallet-app",
+              "integration/pos-app"
+            ]
+          },
+          {
+            "group": "Backend Setup",
+            "pages": [
+              "integration/backend-setup",
+              "integration/database-schema",
+              "integration/sui-configuration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Protocol",
+        "groups": [
+          {
+            "group": "Smart Contracts",
+            "pages": [
+              "protocol/contracts-overview",
+              "protocol/settlement",
+              "protocol/shielded-pool",
+              "protocol/trust-registry",
+              "protocol/meta-address-registry",
+              "protocol/announcements",
+              "protocol/intent",
+              "protocol/receipt",
+              "protocol/warranty",
+              "protocol/zk-verifier"
+            ]
+          },
+          {
+            "group": "ZK Circuits",
+            "pages": [
+              "protocol/circuits-overview",
+              "protocol/identity-registration",
+              "protocol/age-check",
+              "protocol/pool-spend"
+            ]
+          },
+          {
+            "group": "Cryptography",
+            "pages": [
+              "protocol/stealth-addresses",
+              "protocol/poseidon-hashing",
+              "protocol/merkle-trees"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "api/introduction",
+              "api/authentication",
+              "api/errors"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/merchants",
+              "api/proposals",
+              "api/intents",
+              "api/transactions",
+              "api/names",
+              "api/announcements",
+              "api/pay-requests"
+            ]
+          },
+          {
+            "group": "WebSocket",
+            "pages": [
+              "api/websocket"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Intent-based payment protocol",
+    "Stealth address privacy",
+    "Shielded pool for transaction anonymity",
+    "Zero-knowledge proof verification",
+    "Age verification without revealing identity",
+    "Trust registry for merchant verification",
+    "Real-time settlement tracking",
+    "Cardless mobile wallet",
+    "Point-of-sale Android app",
+    "Sui blockchain integration"
+  ],
+  "publicApiSurface": [
+    "POST /api/identipay/v1/merchants",
+    "GET /api/identipay/v1/merchants/:id",
+    "POST /api/identipay/v1/proposals",
+    "GET /api/identipay/v1/proposals/:id",
+    "POST /api/identipay/v1/intents",
+    "GET /api/identipay/v1/intents/:id",
+    "POST /api/identipay/v1/transactions",
+    "GET /api/identipay/v1/transactions/:id",
+    "POST /api/identipay/v1/names/register",
+    "GET /api/identipay/v1/names/:name",
+    "GET /api/identipay/v1/announcements/:metaAddress",
+    "POST /api/identipay/v1/pay-requests",
+    "GET /api/identipay/v1/pay-requests/:id",
+    "WS /ws/transactions/:txId"
+  ]
+}
