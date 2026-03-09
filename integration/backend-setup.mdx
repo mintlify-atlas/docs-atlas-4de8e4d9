@@ -1,0 +1,664 @@
+---
+title: 'Backend Setup'
+description: 'Set up the identiPay backend server with Deno, PostgreSQL, and Sui integration'
+icon: 'server'
+---
+
+## Overview
+
+The identiPay backend is built with:
+
+- **Deno**: Modern TypeScript runtime
+- **Hono**: Fast web framework
+- **Drizzle ORM**: Type-safe database operations
+- **PostgreSQL**: Relational database
+- **Sui SDK**: Blockchain integration
+
+## Prerequisites
+
+- Deno 2.0 or later
+- PostgreSQL 14 or later
+- Sui CLI (for contract deployment)
+- Git
+
+## Quick Start
+
+<Steps>
+
+<Step title="Clone the Repository">
+
+```bash
+git clone https://github.com/your-org/identipay.git
+cd identipay/backend
+```
+
+</Step>
+
+<Step title="Install Deno">
+
+If you don't have Deno installed:
+
+```bash
+curl -fsSL https://deno.land/install.sh | sh
+```
+
+Verify installation:
+
+```bash
+deno --version
+```
+
+</Step>
+
+<Step title="Set Up PostgreSQL">
+
+Create a PostgreSQL database:
+
+```bash
+psql -U postgres
+```
+
+```sql
+CREATE DATABASE identipay;
+CREATE USER identipay_user WITH PASSWORD 'your-secure-password';
+GRANT ALL PRIVILEGES ON DATABASE identipay TO identipay_user;
+```
+
+</Step>
+
+<Step title="Configure Environment Variables">
+
+Create a `.env` file in the `backend` directory:
+
+```bash .env
+# Server Configuration
+PORT=8000
+HOST=0.0.0.0
+
+# Database
+DATABASE_URL=postgresql://identipay_user:your-secure-password@localhost:5432/identipay
+
+# Sui Network
+SUI_RPC_URL=https://fullnode.testnet.sui.io:443
+
+# Deployed Contract Objects (from deployment)
+PACKAGE_ID=0x1d78444dc29300d7ef1fda1cc292b154cba7dce8de68e12371f89179c3fdaf19
+TRUST_REGISTRY_ID=0x...
+META_REGISTRY_ID=0x...
+SETTLEMENT_STATE_ID=0x...
+VERIFICATION_KEY_ID=0x...
+SHIELDED_POOL_ID=0x...
+
+# Admin Keys
+ADMIN_SECRET_KEY=suiprivkey1q...
+
+# ZK Verification Keys
+AGE_CHECK_VK_ID=0x...
+POOL_SPEND_VK_ID=0x...
+```
+
+<Warning>
+Never commit the `.env` file to version control. Keep your admin secret key secure.
+</Warning>
+
+</Step>
+
+<Step title="Run Database Migrations">
+
+```bash
+deno task db:generate
+deno task db:migrate
+```
+
+</Step>
+
+<Step title="Start the Server">
+
+```bash
+# Development mode (with auto-reload)
+deno task dev
+
+# Production mode
+deno task start
+```
+
+The server will start on `http://localhost:8000`.
+
+</Step>
+
+</Steps>
+
+## Environment Variables Reference
+
+### Server Configuration
+
+<ResponseField name="PORT" type="number" default="8000">
+  Port number for the HTTP server
+</ResponseField>
+
+<ResponseField name="HOST" type="string" default="0.0.0.0">
+  Host address to bind to. Use `0.0.0.0` for all interfaces or `127.0.0.1` for localhost only.
+</ResponseField>
+
+### Database
+
+<ResponseField name="DATABASE_URL" type="string" required>
+  PostgreSQL connection string
+  
+  Format: `postgresql://user:password@host:port/database`
+</ResponseField>
+
+### Sui Network
+
+<ResponseField name="SUI_RPC_URL" type="string" default="https://fullnode.testnet.sui.io:443">
+  Sui RPC endpoint URL
+  
+  - **Testnet**: `https://fullnode.testnet.sui.io:443`
+  - **Mainnet**: `https://fullnode.mainnet.sui.io:443`
+  - **Devnet**: `https://fullnode.devnet.sui.io:443`
+</ResponseField>
+
+### Contract Objects
+
+<ResponseField name="PACKAGE_ID" type="string" required>
+  Deployed identiPay package ID (from `sui client publish`)
+</ResponseField>
+
+<ResponseField name="TRUST_REGISTRY_ID" type="string" required>
+  Trust registry shared object ID
+</ResponseField>
+
+<ResponseField name="META_REGISTRY_ID" type="string" required>
+  Meta-address registry shared object ID (stores identity commitments and public keys)
+</ResponseField>
+
+<ResponseField name="SETTLEMENT_STATE_ID" type="string" required>
+  Settlement state shared object ID (tracks settled transactions)
+</ResponseField>
+
+<ResponseField name="VERIFICATION_KEY_ID" type="string" required>
+  Identity verification key object ID
+</ResponseField>
+
+<ResponseField name="SHIELDED_POOL_ID" type="string" required>
+  Shielded pool object ID (for privacy-preserving payments)
+</ResponseField>
+
+### Admin Configuration
+
+<ResponseField name="ADMIN_SECRET_KEY" type="string" required>
+  Admin wallet secret key in Sui format (`suiprivkey1q...`)
+  
+  Used for submitting transactions on behalf of users.
+</ResponseField>
+
+### ZK Verification Keys
+
+<ResponseField name="AGE_CHECK_VK_ID" type="string">
+  Age verification key object ID (optional)
+</ResponseField>
+
+<ResponseField name="POOL_SPEND_VK_ID" type="string">
+  Pool spend verification key object ID (optional)
+</ResponseField>
+
+## Configuration Code
+
+The backend uses a centralized configuration module:
+
+```typescript src/config.ts
+function env(key: string, fallback?: string): string {
+  const value = Deno.env.get(key) ?? fallback;
+  if (value === undefined) {
+    throw new Error(`Missing required environment variable: ${key}`);
+  }
+  return value;
+}
+
+export const config = {
+  port: parseInt(env("PORT", "8000")),
+  host: env("HOST", "0.0.0.0"),
+  databaseUrl: env("DATABASE_URL"),
+  suiRpcUrl: env("SUI_RPC_URL", "https://fullnode.testnet.sui.io:443"),
+  packageId: env("PACKAGE_ID"),
+  trustRegistryId: env("TRUST_REGISTRY_ID"),
+  metaRegistryId: env("META_REGISTRY_ID"),
+  settlementStateId: env("SETTLEMENT_STATE_ID"),
+  adminSecretKey: env("ADMIN_SECRET_KEY"),
+  verificationKeyId: env("VERIFICATION_KEY_ID"),
+  ageCheckVkId: env("AGE_CHECK_VK_ID", ""),
+  poolSpendVkId: env("POOL_SPEND_VK_ID", ""),
+  shieldedPoolId: env("SHIELDED_POOL_ID", ""),
+} as const;
+```
+
+## Database Setup
+
+### Drizzle Configuration
+
+```typescript drizzle.config.ts
+import { defineConfig } from "drizzle-kit";
+
+export default defineConfig({
+  schema: "./src/db/schema.ts",
+  out: "./drizzle",
+  dialect: "postgresql",
+  dbCredentials: {
+    url: Deno.env.get("DATABASE_URL")!,
+  },
+});
+```
+
+### Running Migrations
+
+<CodeGroup>
+
+```bash Generate Migrations
+# Generate migration files from schema changes
+deno task db:generate
+```
+
+```bash Apply Migrations
+# Apply migrations to database
+deno task db:migrate
+```
+
+</CodeGroup>
+
+## Server Architecture
+
+The backend is structured as follows:
+
+```typescript src/main.ts
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { config } from "./config.ts";
+import { createDb } from "./db/connection.ts";
+import { SuiService } from "./services/sui.service.ts";
+
+// Initialize database
+const { db, client: _pgClient } = createDb(config.databaseUrl);
+
+// Initialize Sui service
+const suiService = new SuiService({
+  rpcUrl: config.suiRpcUrl,
+  packageId: config.packageId,
+  trustRegistryId: config.trustRegistryId,
+  metaRegistryId: config.metaRegistryId,
+  settlementStateId: config.settlementStateId,
+  adminSecretKey: config.adminSecretKey,
+  verificationKeyId: config.verificationKeyId,
+  ageCheckVkId: config.ageCheckVkId,
+  poolSpendVkId: config.poolSpendVkId,
+  shieldedPoolId: config.shieldedPoolId,
+});
+
+// Create Hono app
+const app = new Hono();
+
+// Global middleware
+app.use("*", cors());
+app.onError(errorHandler);
+
+// Health check
+app.get("/health", (c) => c.json({ status: "ok" }));
+
+// Mount API routes
+const api = new Hono();
+api.route("/merchants", merchantRoutes({ db, suiService }));
+api.route("/proposals", proposalRoutes({ db, packageId: config.packageId }));
+api.route("/intents", intentRoutes({ db }));
+api.route("/transactions", transactionRoutes({ db, suiService }));
+api.route("/names", nameRoutes({ db, suiService }));
+api.route("/announcements", announcementRoutes({ db }));
+api.route("/pay-requests", payRequestRoutes({ db, suiService }));
+
+app.route("/api/identipay/v1", api);
+
+// Start server
+console.log(`identiPay backend starting on ${config.host}:${config.port}`);
+Deno.serve({ port: config.port, hostname: config.host }, app.fetch);
+```
+
+## API Routes
+
+The backend exposes the following API endpoints:
+
+<CardGroup cols={2}>
+  <Card title="Merchants" icon="store">
+    `/api/identipay/v1/merchants`
+    
+    Register and manage merchant accounts
+  </Card>
+  
+  <Card title="Proposals" icon="file-contract">
+    `/api/identipay/v1/proposals`
+    
+    Create and retrieve payment proposals
+  </Card>
+  
+  <Card title="Intents" icon="signature">
+    `/api/identipay/v1/intents`
+    
+    Submit signed payment intents
+  </Card>
+  
+  <Card title="Transactions" icon="exchange">
+    `/api/identipay/v1/transactions`
+    
+    Query transaction status and history
+  </Card>
+  
+  <Card title="Names" icon="user">
+    `/api/identipay/v1/names`
+    
+    Register and lookup user names
+  </Card>
+  
+  <Card title="Announcements" icon="bullhorn">
+    `/api/identipay/v1/announcements`
+    
+    Query stealth address announcements
+  </Card>
+  
+  <Card title="Pay Requests" icon="qrcode">
+    `/api/identipay/v1/pay-requests`
+    
+    Create and manage payment requests
+  </Card>
+</CardGroup>
+
+## Background Services
+
+The backend runs several background indexers:
+
+### Settlement Event Indexer
+
+```typescript
+const POLL_INTERVAL_MS = 3_000; // 3 seconds
+const SETTLEMENT_CURSOR_KEY = "settlement::SettlementEvent";
+
+async function pollSettlementEvents(): Promise<void> {
+  let cursor = await loadCursor(SETTLEMENT_CURSOR_KEY);
+  
+  let hasMore = true;
+  while (hasMore) {
+    const result = await suiService.pollSettlementEvents(cursor);
+    
+    for (const event of result.events) {
+      const [proposal] = await db
+        .select()
+        .from(proposals)
+        .where(eq(proposals.intentHash, event.intentHash))
+        .limit(1);
+      
+      if (proposal && proposal.status === "pending") {
+        await db
+          .update(proposals)
+          .set({ status: "settled", suiTxDigest: event.txDigest })
+          .where(eq(proposals.transactionId, proposal.transactionId));
+        
+        pushSettlementUpdate(
+          proposal.transactionId,
+          "settled",
+          event.txDigest,
+        );
+      }
+    }
+    
+    if (result.nextCursor) {
+      cursor = result.nextCursor;
+      await saveCursor(SETTLEMENT_CURSOR_KEY, cursor);
+    }
+    
+    hasMore = result.hasNextPage;
+  }
+}
+
+startPollingLoop("Settlement indexer", pollSettlementEvents, POLL_INTERVAL_MS);
+```
+
+### Announcement Indexer
+
+```typescript
+const ANNOUNCEMENT_CURSOR_KEY = "announcements::StealthAnnouncement";
+
+async function pollAnnouncementEvents(): Promise<void> {
+  let cursor = await loadCursor(ANNOUNCEMENT_CURSOR_KEY);
+  
+  let hasMore = true;
+  while (hasMore) {
+    const result = await suiService.pollAnnouncementEvents(cursor);
+    
+    for (const event of result.events) {
+      await db.insert(announcements).values({
+        ephemeralPubkey: event.ephemeralPubkey,
+        viewTag: event.viewTag,
+        stealthAddress: event.stealthAddress,
+        metadata: event.metadata,
+        txDigest: event.txDigest,
+        timestamp: new Date(parseInt(event.timestamp)),
+      });
+    }
+    
+    if (result.nextCursor) {
+      cursor = result.nextCursor;
+      await saveCursor(ANNOUNCEMENT_CURSOR_KEY, cursor);
+    }
+    
+    hasMore = result.hasNextPage;
+  }
+}
+
+startPollingLoop("Announcement indexer", pollAnnouncementEvents, POLL_INTERVAL_MS);
+```
+
+### Proposal Expiry Checker
+
+```typescript
+function startExpiryChecker() {
+  setInterval(async () => {
+    try {
+      await db
+        .update(proposals)
+        .set({ status: "expired" })
+        .where(
+          and(
+            eq(proposals.status, "pending"),
+            lt(proposals.expiresAt, new Date()),
+          ),
+        );
+    } catch (error) {
+      console.error("Expiry checker error:", error);
+    }
+  }, 30_000); // Every 30 seconds
+}
+```
+
+## WebSocket Support
+
+The backend provides WebSocket endpoints for real-time transaction updates:
+
+```typescript
+// WebSocket for transaction status
+app.get("/ws/transactions/:txId", (c) => {
+  const txId = c.req.param("txId");
+  const { response, socket } = Deno.upgradeWebSocket(c.req.raw);
+  
+  socket.onopen = () => {
+    const wsWrapper = {
+      send: (data: string) => socket.send(data),
+      close: () => socket.close(),
+    };
+    const cleanup = handleWsConnection(txId, wsWrapper, db);
+    socket.onclose = () => cleanup();
+  };
+  
+  return response;
+});
+```
+
+## Deno Tasks
+
+The `deno.json` file defines convenient task commands:
+
+```json deno.json
+{
+  "tasks": {
+    "dev": "deno run --env-file --allow-net --allow-env --allow-read --watch src/main.ts",
+    "start": "deno run --env-file --allow-net --allow-env --allow-read src/main.ts",
+    "test": "deno test --env-file --allow-net --allow-env --allow-read tests/",
+    "db:generate": "deno run --node-modules-dir --env-file --allow-net --allow-env --allow-read --allow-write --allow-run npm:drizzle-kit generate",
+    "db:migrate": "deno run --env-file --allow-net --allow-env --allow-read src/db/migrate.ts"
+  }
+}
+```
+
+<CodeGroup>
+
+```bash Development
+deno task dev
+```
+
+```bash Production
+deno task start
+```
+
+```bash Tests
+deno task test
+```
+
+</CodeGroup>
+
+## Testing
+
+### Health Check
+
+```bash
+curl http://localhost:8000/health
+```
+
+Expected response:
+
+```json
+{
+  "status": "ok"
+}
+```
+
+### Create Test Merchant
+
+```bash
+curl -X POST http://localhost:8000/api/identipay/v1/merchants \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Test Store",
+    "suiAddress": "0x1234...",
+    "hostname": "teststore.local",
+    "publicKey": "abcd...",
+    "apiKey": "test-key-123"
+  }'
+```
+
+## Production Deployment
+
+### Using Docker
+
+```dockerfile Dockerfile
+FROM denoland/deno:2.0.0
+
+WORKDIR /app
+
+COPY deno.json deno.lock ./
+RUN deno install --entrypoint src/main.ts
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["deno", "task", "start"]
+```
+
+### Using Docker Compose
+
+```yaml docker-compose.yml
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: identipay
+      POSTGRES_USER: identipay_user
+      POSTGRES_PASSWORD: secure-password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+  
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://identipay_user:secure-password@postgres:5432/identipay
+      SUI_RPC_URL: https://fullnode.testnet.sui.io:443
+      PACKAGE_ID: ${PACKAGE_ID}
+      TRUST_REGISTRY_ID: ${TRUST_REGISTRY_ID}
+      META_REGISTRY_ID: ${META_REGISTRY_ID}
+      SETTLEMENT_STATE_ID: ${SETTLEMENT_STATE_ID}
+      ADMIN_SECRET_KEY: ${ADMIN_SECRET_KEY}
+      VERIFICATION_KEY_ID: ${VERIFICATION_KEY_ID}
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
+```
+
+## Troubleshooting
+
+### Database Connection Failed
+
+```
+Error: connection to server failed
+```
+
+**Solution**: Verify PostgreSQL is running and `DATABASE_URL` is correct:
+
+```bash
+psql $DATABASE_URL -c "SELECT 1;"
+```
+
+### Missing Environment Variable
+
+```
+Error: Missing required environment variable: PACKAGE_ID
+```
+
+**Solution**: Ensure all required variables are set in `.env`.
+
+### Sui RPC Connection Failed
+
+```
+Error: Failed to connect to Sui RPC
+```
+
+**Solution**: Check network connectivity and verify `SUI_RPC_URL`:
+
+```bash
+curl -X POST https://fullnode.testnet.sui.io:443 \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"sui_getChainIdentifier","params":[]}'
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Database Schema" icon="database" href="/integration/database-schema">
+    Learn about the database structure
+  </Card>
+  <Card title="Sui Configuration" icon="link" href="/integration/sui-configuration">
+    Deploy and configure Sui contracts
+  </Card>
+</CardGroup>

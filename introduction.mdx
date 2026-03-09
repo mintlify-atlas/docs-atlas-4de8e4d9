@@ -1,0 +1,121 @@
+---
+title: "Introduction"
+description: "Privacy-preserving payment protocol with cardless transactions powered by verified digital identity"
+---
+
+## Welcome to identiPay
+
+identiPay is a next-generation payment protocol that eliminates the need for credit cards while providing unprecedented privacy and security. Built on the Sui blockchain, identiPay enables instant, private payments using verified digital identity and zero-knowledge proofs.
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Get started with identiPay in minutes
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Learn how identiPay works
+  </Card>
+  <Card title="Merchant Integration" icon="store" href="/integration/merchant-overview">
+    Integrate identiPay into your store
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/introduction">
+    Explore the identiPay API
+  </Card>
+</CardGroup>
+
+## Why identiPay?
+
+Traditional payment systems rely on pull-based credentials like credit cards, where merchants can initiate charges using stored payment details. This creates significant security and privacy risks.
+
+<CardGroup cols={2}>
+  <Card title="Intent-Based Payments" icon="hand-pointer" href="/concepts/intent-based-payments">
+    Payments initiated by users, not merchants
+  </Card>
+  <Card title="Stealth Addresses" icon="eye-slash" href="/concepts/stealth-addresses">
+    Private payments that can't be linked
+  </Card>
+  <Card title="Shielded Pools" icon="shield-halved" href="/concepts/shielded-pools">
+    Break transaction graphs for anonymity
+  </Card>
+  <Card title="Zero-Knowledge Proofs" icon="lock" href="/concepts/zero-knowledge-proofs">
+    Verify without revealing information
+  </Card>
+</CardGroup>
+
+## Key Features
+
+<AccordionGroup>
+  <Accordion title="Cardless Transactions" icon="wallet">
+    Pay instantly using your verified digital identity managed in the identiPay wallet. No credit card numbers, no CVV codes, no expiration dates to remember or steal.
+  </Accordion>
+  
+  <Accordion title="Privacy by Design" icon="user-secret">
+    Every transaction uses stealth addresses and shielded pools to protect your financial privacy. Even merchants can't track your spending patterns across multiple purchases.
+  </Accordion>
+  
+  <Accordion title="Age Verification" icon="id-card">
+    Prove you're over 18 (or 21) without revealing your birthdate, name, or any other personal information using zero-knowledge proofs.
+  </Accordion>
+  
+  <Accordion title="Instant Settlement" icon="bolt">
+    Transactions settle on the Sui blockchain in seconds, not days. Real-time WebSocket updates keep all parties informed of payment status.
+  </Accordion>
+  
+  <Accordion title="Fraud Prevention" icon="shield-check">
+    Push-based payments mean you explicitly authorize every transaction. No surprise charges, no subscription traps, no credential replay attacks.
+  </Accordion>
+  
+  <Accordion title="Trust Registry" icon="certificate">
+    Verified merchants are registered on-chain. Users can verify a merchant's legitimacy before making a payment.
+  </Accordion>
+</AccordionGroup>
+
+## How It Works
+
+<Steps>
+  <Step title="User Creates Payment Intent">
+    The user scans a QR code or receives a payment request from a merchant. This contains the amount, merchant ID, and transaction details.
+  </Step>
+  
+  <Step title="Intent Broadcast">
+    The user's wallet broadcasts a signed payment intent to the identiPay network, committing to pay the specified amount.
+  </Step>
+  
+  <Step title="Privacy Layer">
+    The payment is routed through stealth addresses and optionally through shielded pools to break transaction linkability.
+  </Step>
+  
+  <Step title="Settlement">
+    The payment settles on-chain with zero-knowledge proofs verifying authorization without revealing user identity.
+  </Step>
+  
+  <Step title="Confirmation">
+    Both parties receive instant confirmation. The merchant can release goods/services immediately.
+  </Step>
+</Steps>
+
+## Use Cases
+
+<CardGroup cols={3}>
+  <Card title="Retail Payments" icon="cart-shopping" href="/use-cases/merchant-payments">
+    Accept payments in physical stores with POS app
+  </Card>
+  <Card title="E-commerce" icon="globe" href="/integration/checkout-integration">
+    Integrate checkout on your website
+  </Card>
+  <Card title="Age-Restricted Sales" icon="wine-glass" href="/use-cases/age-verification">
+    Verify age without ID collection
+  </Card>
+</CardGroup>
+
+## Getting Started
+
+Ready to experience the future of secure transactions?
+
+<CardGroup cols={2}>
+  <Card title="For Users" icon="mobile" href="/integration/wallet-app">
+    Download the identiPay wallet app and set up your identity
+  </Card>
+  <Card title="For Merchants" icon="briefcase" href="/integration/merchant-overview">
+    Integrate identiPay into your payment flow
+  </Card>
+</CardGroup>

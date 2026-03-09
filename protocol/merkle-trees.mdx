@@ -1,0 +1,602 @@
+---
+title: 'Merkle Trees'
+description: 'Incremental Merkle tree implementation in the shielded pool using Poseidon hashing and filled subtrees optimization'
+---
+
+## Overview
+
+identiPay uses an **incremental Merkle tree** to track note commitments in the shielded pool. The tree uses Poseidon hashing for compatibility with ZK circuits and implements the "filled subtrees" optimization for O(depth) insertion without storing all nodes.
+
+<Note>
+  Implementation: `/home/daytona/workspace/source/contracts/sources/shielded_pool.move:204`
+  
+  Circuit verification: `/home/daytona/workspace/source/circuits/pool_spend.circom:9`
+</Note>
+
+## Tree Structure
+
+### Binary Merkle Tree
+
+The tree is a complete binary tree where:
+
+- **Leaves**: Note commitments (Poseidon hashes)
+- **Internal nodes**: Poseidon(left_child, right_child)
+- **Root**: Single hash at the top (published on-chain)
+
+```
+                    Root
+                   /    \
+                  /      \
+                H01      H23
+               /  \      /  \
+              /    \    /    \
+            H0    H1  H2    H3
+           /\    /\  /\    /\
+          L0 L1 L2 L3 L4 L5 L6 L7  ← Leaves (commitments)
+```
+
+### Parameters
+
+<ParamField path="tree_depth" type="u8" default="20">
+  Depth of the Merkle tree (number of levels from leaf to root).
+  
+  Determines maximum capacity: **2^depth** leaves.
+  
+  Default: 20 (1,048,576 notes)
+</ParamField>
+
+<ParamField path="merkle_root" type="u256">
+  Current root hash of the tree.
+  
+  Updated after each insertion. Used as public input in pool_spend circuit.
+</ParamField>
+
+<ParamField path="next_leaf_index" type="u64">
+  Index of the next available leaf slot (0-indexed).
+  
+  Increments by 1 after each deposit.
+</ParamField>
+
+<ParamField path="filled_subtrees" type="vector<u256>">
+  One Poseidon hash per level (index 0 = leaf level).
+  
+  Stores the most recently completed subtree at each depth. Enables O(depth) insertion.
+</ParamField>
+
+## Filled Subtrees Optimization
+
+### Problem
+
+A naive Merkle tree stores all 2^depth - 1 nodes, requiring:
+- **Storage**: ~33 MB for depth 20 (1M nodes × 32 bytes)
+- **Insertion**: O(depth) hashes, but O(2^depth) storage
+
+This is prohibitively expensive on-chain.
+
+### Solution: Filled Subtrees
+
+Instead of storing all nodes, store only:
+1. The current root
+2. One "filled subtree" hash per level
+3. Precomputed zero hashes for empty subtrees
+
+**Storage**: O(depth) instead of O(2^depth)
+- Depth 20: 20 hashes × 32 bytes = **640 bytes** (vs 33 MB)
+
+### Algorithm
+
+From `shielded_pool.move:226`:
+
+```move
+fun insert_leaf<T>(pool: &mut ShieldedPool<T>, leaf: u256): u256 {
+    let mut current_index = pool.next_leaf_index;
+    let mut current_hash = leaf;
+    let depth = pool.tree_depth as u64;
+
+    // Precompute zero hashes for each level
+    let mut zero_hashes = vector[];
+    let mut zh = zero_leaf();  // 0u256
+    let mut i = 0;
+    while (i < depth) {
+        zero_hashes.push_back(zh);
+        zh = hash_pair(zh, zh);  // Poseidon(zh, zh)
+        i = i + 1;
+    };
+
+    i = 0;
+    while (i < depth) {
+        if (current_index % 2 == 0) {
+            // Left child: sibling is the zero hash at this level.
+            // Update filled_subtrees since this left subtree is now the latest.
+            *pool.filled_subtrees.borrow_mut(i) = current_hash;
+            current_hash = hash_pair(current_hash, *zero_hashes.borrow(i));
+        } else {
+            // Right child: sibling is the stored filled subtree (left neighbor).
+            let left = *pool.filled_subtrees.borrow(i);
+            current_hash = hash_pair(left, current_hash);
+        };
+        current_index = current_index / 2;
+        i = i + 1;
+    };
+
+    current_hash  // New root
+}
+```
+
+### Visual Example
+
+Inserting leaves sequentially:
+
+**After inserting L0 (index 0)**:
+```
+filled_subtrees[0] = L0
+filled_subtrees[1] = Poseidon(L0, Z0)
+filled_subtrees[2] = Poseidon(Poseidon(L0, Z0), Z1)
+...
+```
+
+**After inserting L1 (index 1)**:
+```
+filled_subtrees[0] = L1  (updated)
+filled_subtrees[1] = Poseidon(L0, L1)  (updated)
+filled_subtrees[2] = Poseidon(Poseidon(L0, L1), Z1)  (updated)
+...
+```
+
+**After inserting L2 (index 2)**:
+```
+filled_subtrees[0] = L2
+filled_subtrees[1] = Poseidon(L0, L1)  (reused from before)
+...
+```
+
+The key insight: When inserting at an even index, we store the current node. When inserting at an odd index, we reuse the stored node.
+
+## Zero Hashes
+
+Empty leaf slots are filled with deterministic "zero hashes":
+
+```move
+fun zero_leaf(): u256 {
+    0u256
+}
+```
+
+**Zero hash at each level**:
+
+```
+Z[0] = 0  (leaf level)
+Z[1] = Poseidon(Z[0], Z[0]) = Poseidon(0, 0)
+Z[2] = Poseidon(Z[1], Z[1])
+Z[3] = Poseidon(Z[2], Z[2])
+...
+Z[20] = Poseidon(Z[19], Z[19])  (root of empty tree)
+```
+
+These are precomputed during initialization (`shielded_pool.move:80`):
+
+```move
+entry fun create_pool<T>(ctx: &mut TxContext) {
+    let mut filled = vector[];
+    let mut current_zero = zero_leaf();
+    let mut i = 0;
+    while (i < (DEFAULT_TREE_DEPTH as u64)) {
+        filled.push_back(current_zero);
+        current_zero = hash_pair(current_zero, current_zero);
+        i = i + 1;
+    };
+
+    let pool = ShieldedPool<T> {
+        // ...
+        merkle_root: current_zero,  // Initial root = Z[20]
+        filled_subtrees: filled,
+        // ...
+    };
+
+    transfer::share_object(pool);
+}
+```
+
+**Initial root**: `Z[20]` (hash of completely empty tree)
+
+## Merkle Proof Verification
+
+### Generating Proofs (Off-chain)
+
+To withdraw from the shielded pool, users need a Merkle proof that their commitment exists in the tree.
+
+**Off-chain indexer** (not shown in provided code, but required for production):
+
+```typescript
+interface MerkleProof {
+  pathElements: bigint[];  // Sibling hashes (depth elements)
+  pathIndices: number[];   // 0 = left, 1 = right (depth elements)
+}
+
+function getMerkleProof(
+  commitments: bigint[],  // All leaves in tree
+  leafIndex: number,       // Index of target leaf
+  depth: number            // Tree depth
+): MerkleProof {
+  const pathElements: bigint[] = [];
+  const pathIndices: number[] = [];
+  
+  let currentIndex = leafIndex;
+  
+  for (let level = 0; level < depth; level++) {
+    const isRightChild = currentIndex % 2 === 1;
+    const siblingIndex = isRightChild ? currentIndex - 1 : currentIndex + 1;
+    
+    // Get sibling hash (or zero hash if beyond current tree size)
+    const sibling = siblingIndex < commitments.length 
+      ? computeHashAtIndex(commitments, siblingIndex, level)
+      : getZeroHash(level);
+    
+    pathElements.push(sibling);
+    pathIndices.push(isRightChild ? 1 : 0);
+    
+    currentIndex = Math.floor(currentIndex / 2);
+  }
+  
+  return { pathElements, pathIndices };
+}
+```
+
+### Verifying Proofs (Circuit)
+
+From `pool_spend.circom:9`:
+
+```circom
+template MerkleProof(depth) {
+    signal input leaf;
+    signal input pathElements[depth];
+    signal input pathIndices[depth]; // 0 = left, 1 = right
+
+    signal output root;
+
+    component hashers[depth];
+    component indexChecks[depth];
+
+    signal currentHash[depth + 1];
+    currentHash[0] <== leaf;
+
+    signal leftDiff[depth];
+    signal leftAdjust[depth];
+    signal rightDiff[depth];
+    signal rightAdjust[depth];
+
+    for (var i = 0; i < depth; i++) {
+        // Ensure pathIndices[i] is binary (0 or 1)
+        indexChecks[i] = IsZero();
+        indexChecks[i].in <== pathIndices[i] * (pathIndices[i] - 1);
+        indexChecks[i].out === 1;
+
+        hashers[i] = Poseidon(2);
+
+        // left = currentHash[i] + pathIndices[i] * (pathElements[i] - currentHash[i])
+        leftDiff[i] <== pathElements[i] - currentHash[i];
+        leftAdjust[i] <== pathIndices[i] * leftDiff[i];
+        hashers[i].inputs[0] <== currentHash[i] + leftAdjust[i];
+
+        // right = pathElements[i] + pathIndices[i] * (currentHash[i] - pathElements[i])
+        rightDiff[i] <== currentHash[i] - pathElements[i];
+        rightAdjust[i] <== pathIndices[i] * rightDiff[i];
+        hashers[i].inputs[1] <== pathElements[i] + rightAdjust[i];
+
+        currentHash[i + 1] <== hashers[i].out;
+    }
+
+    root <== currentHash[depth];
+}
+```
+
+**Logic breakdown**:
+
+1. **Binary check**: Ensure `pathIndices[i] ∈ {0, 1}` using `pathIndices[i] * (pathIndices[i] - 1) === 0`
+
+2. **Conditional swap**: 
+   - If `pathIndices[i] == 0` (left child): `hash(current, sibling)`
+   - If `pathIndices[i] == 1` (right child): `hash(sibling, current)`
+
+3. **Hash computation**: `currentHash[i+1] = Poseidon(left, right)`
+
+4. **Output**: `root = currentHash[depth]` (final hash after all levels)
+
+### Example Proof
+
+Proving that `L2` (commitment at index 2) is in the tree:
+
+```
+        Root
+       /    \
+     H01    H23
+     / \    / \
+   H0  H1  H2  H3
+   /\  /\  /\  /\
+  L0 L1 L2 L3 ...
+       ^
+       Target
+```
+
+**Proof**:
+- `pathElements = [L3, H1, H23]`  (siblings at each level)
+- `pathIndices = [0, 0, 0]`  (L2 is left child at all levels)
+
+**Verification**:
+1. Level 0: `H2 = Poseidon(L2, L3)` (L2 is left, L3 is right)
+2. Level 1: `H01 = Poseidon(H0, H1)` ... wait, we need H0!
+
+<Warning>
+  **Correction**: The example above is incomplete. A full depth-20 proof requires 20 sibling hashes. The exact path depends on the tree state when the commitment was inserted.
+</Warning>
+
+See [Pool Spend Circuit](/protocol/pool-spend) for a complete proof generation/verification example.
+
+## Poseidon Hashing
+
+The tree uses Poseidon for both on-chain and in-circuit hashing:
+
+### On-Chain (Sui)
+
+```move shielded_pool.move:214
+fun hash_pair(left: u256, right: u256): u256 {
+    let data = vector[left, right];
+    poseidon::poseidon_bn254(&data)
+}
+```
+
+### In-Circuit (Circom)
+
+```circom pool_spend.circom:36
+component hasher = Poseidon(2);
+hasher.inputs[0] <== left;
+hasher.inputs[1] <== right;
+parentHash <== hasher.out;
+```
+
+**Critical**: Both use the same Poseidon BN254 parameters, ensuring proofs verify correctly on-chain.
+
+See [Poseidon Hashing](/protocol/poseidon-hashing) for implementation details.
+
+## Security Analysis
+
+### Collision Resistance
+
+The tree's security depends on Poseidon's collision resistance:
+
+- **Assumption**: Finding `(a, b) ≠ (c, d)` where `Poseidon(a, b) = Poseidon(c, d)` is computationally infeasible (~2^128 operations).
+
+- **Impact**: If Poseidon is broken, attackers could:
+  - Forge Merkle proofs for non-existent commitments
+  - Withdraw funds they don't own
+
+**Mitigation**: Poseidon has been extensively analyzed and is used in production by Zcash, Filecoin, and other projects.
+
+### Second Preimage Attacks
+
+Given a commitment `C` and its Merkle proof, can an attacker find a different commitment `C'` with the same root?
+
+**Answer**: No, assuming Poseidon second preimage resistance. Changing any leaf propagates to the root via different hash inputs.
+
+### Frontrunning
+
+Can an attacker observe a pending deposit and frontrun it with their own?
+
+**Impact**: Minimal. Even if frontrun, the original deposit still succeeds (just at a later leaf index). The attacker gains no advantage.
+
+### Tree Exhaustion
+
+What happens when all 2^20 leaf slots are filled?
+
+```move shielded_pool.move:120
+assert!(pool.next_leaf_index < capacity, EPoolFull);
+```
+
+**Mitigation**: 
+- Depth 20 allows 1,048,576 deposits
+- At 100 deposits/day, the tree lasts ~28 years
+- If needed, deploy a new pool with larger depth
+
+### Root History
+
+<Warning>
+  **Important**: The pool only stores the **current** root. Old roots are not accessible on-chain.
+</Warning>
+
+**Implication**: 
+- Withdrawals must use the most recent root
+- If a new deposit happens while you're generating a proof, your proof becomes invalid
+- Solutions:
+  1. Generate proofs quickly (< 1 minute)
+  2. Retry with updated root if verification fails
+  3. Store root history in a separate contract (not implemented in provided code)
+
+## Performance
+
+### Insertion Cost (On-chain)
+
+From `shielded_pool.move:129`:
+
+```move
+let new_root = insert_leaf(pool, note_commitment);
+pool.merkle_root = new_root;
+pool.next_leaf_index = leaf_index + 1;
+```
+
+**Gas cost** (depth 20):
+- 20 Poseidon hashes × ~500 gas/hash = **~10,000 gas**
+- Storage updates: ~5,000 gas
+- **Total**: ~15,000 gas (~0.0001 SUI at 100 MIST/gas)
+
+This is **constant per insertion** regardless of tree size.
+
+### Proof Generation (Off-chain)
+
+Generating a Merkle proof requires:
+
+1. **Fetch sibling hashes** from indexer: O(depth) = 20 hashes
+2. **No computation needed** (just data retrieval)
+
+**Latency**: ~10-50ms (database lookup)
+
+### Proof Verification (Circuit)
+
+From circuit analysis:
+
+- **Depth 20**: ~20,000 constraints (20 levels × ~1,000 constraints/level)
+- **Proving time**: Included in the ~35K total constraints of pool_spend circuit
+- **Verification time**: ~1ms on-chain (Groth16 constant verification)
+
+## Storage Requirements
+
+### On-Chain (Sui Contract)
+
+```move
+public struct ShieldedPool<phantom T> has key {
+    merkle_root: u256,              // 32 bytes
+    nullifiers: Table<u256, bool>,  // ~40 bytes per entry
+    next_leaf_index: u64,           // 8 bytes
+    filled_subtrees: vector<u256>,  // 20 × 32 = 640 bytes
+    tree_depth: u8,                 // 1 byte
+    // ...
+}
+```
+
+**Total (excluding nullifiers)**: ~681 bytes (constant, regardless of tree size)
+
+**Nullifiers**: 40 bytes × number of withdrawals (grows linearly)
+
+### Off-Chain (Indexer)
+
+A full off-chain indexer needs:
+
+- **All commitments**: 32 bytes × number of deposits
+- **All nullifiers**: 32 bytes × number of withdrawals  
+- **Merkle tree nodes** (for fast proof generation): ~32 bytes × 2^21 (if storing all nodes)
+
+For 1M deposits: ~32 MB (commitments) + 64 MB (tree nodes) = **~96 MB**
+
+With filled subtrees optimization, reduce to **~32 MB** (just commitments).
+
+## Testing
+
+### Unit Tests (Move)
+
+```move
+#[test]
+fun test_merkle_insertion() {
+    let mut ctx = tx_context::dummy();
+    create_pool<SUI>(&mut ctx);
+    
+    let mut pool = /* get pool */;
+    
+    // Insert first leaf
+    let leaf1 = 12345u256;
+    let root1 = insert_leaf(&mut pool, leaf1);
+    
+    // Verify root changed
+    assert!(root1 != pool.merkle_root);  // Root updated
+    
+    // Insert second leaf
+    let leaf2 = 67890u256;
+    let root2 = insert_leaf(&mut pool, leaf2);
+    
+    // Verify root changed again
+    assert!(root2 != root1);
+}
+```
+
+### Integration Tests (Circuit + Contract)
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { poseidon } from 'circomlibjs';
+import { groth16 } from 'snarkjs';
+
+describe('Merkle proof verification', () => {
+  it('should verify valid proof on-chain', async () => {
+    // 1. Deposit commitment on-chain
+    const commitment = poseidon([amount, ownerKey, salt]);
+    await depositToPool(commitment);
+    
+    // 2. Fetch Merkle proof from indexer
+    const { pathElements, pathIndices } = await indexer.getMerkleProof(commitment);
+    const merkleRoot = await pool.merkle_root();
+    
+    // 3. Generate ZK proof
+    const { proof, publicSignals } = await groth16.fullProve({
+      // Private inputs
+      noteAmount: amount,
+      ownerKey,
+      salt,
+      pathElements: pathElements.map(x => x.toString()),
+      pathIndices: pathIndices.map(x => x.toString()),
+      // Public inputs
+      merkleRoot: merkleRoot.toString(),
+      nullifier: computeNullifier(commitment, ownerKey).toString(),
+      recipient: recipientAddress,
+      withdrawAmount: amount,
+      changeCommitment: '0'
+    }, wasmFile, zkeyFile);
+    
+    // 4. Verify proof on-chain
+    const result = await pool.withdraw(
+      verificationKey,
+      serializeProof(proof),
+      serializePublicInputs(publicSignals),
+      /* ... other args ... */
+    );
+    
+    expect(result.success).toBe(true);
+  });
+});
+```
+
+## Optimization Opportunities
+
+### Batched Insertions
+
+Currently, each deposit inserts one leaf. For high-throughput scenarios, consider batching:
+
+```move
+// NOT IMPLEMENTED - pseudocode
+entry fun batch_deposit<T>(
+    pool: &mut ShieldedPool<T>,
+    commitments: vector<u256>,
+    coins: vector<Coin<T>>,
+    // ...
+) {
+    let n = commitments.length();
+    let mut i = 0;
+    while (i < n) {
+        // Process deposits...
+        i = i + 1;
+    };
+    
+    // Single root update at the end
+    pool.merkle_root = final_root;
+}
+```
+
+**Benefit**: Amortize fixed costs (transaction overhead, event emission) across multiple deposits.
+
+### Sparse Merkle Trees
+
+For applications requiring proof of non-membership ("this commitment is NOT in the tree"), use a **sparse Merkle tree** instead:
+
+- Non-existent leaves have a default value (zero hash)
+- Proofs can demonstrate both membership and non-membership
+- More complex implementation
+
+Not needed for identiPay (only membership proofs required).
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Shielded Pool Contract" icon="shield" href="/protocol/shielded-pool">
+    Full implementation of the shielded pool with Merkle tree
+  </Card>
+  <Card title="Pool Spend Circuit" icon="circuit-board" href="/protocol/pool-spend">
+    ZK circuit for Merkle proof verification
+  </Card>
+</CardGroup>

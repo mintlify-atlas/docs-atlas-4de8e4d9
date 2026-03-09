@@ -1,0 +1,140 @@
+---
+title: "Smart Contracts Overview"
+description: "Core Move smart contracts powering the identiPay protocol on Sui"
+---
+
+## Architecture
+
+The identiPay protocol consists of 10 Move modules deployed on the Sui blockchain. These contracts work together to enable privacy-preserving, intent-based payments with zero-knowledge proofs.
+
+<CardGroup cols={2}>
+  <Card title="Settlement" icon="hand-holding-dollar" href="/protocol/settlement">
+    Atomic commerce execution orchestrator
+  </Card>
+  <Card title="Shielded Pool" icon="shield-halved" href="/protocol/shielded-pool">
+    Privacy firewall for coin merging
+  </Card>
+  <Card title="Trust Registry" icon="certificate" href="/protocol/trust-registry">
+    Verified merchant identity database
+  </Card>
+  <Card title="Meta-Address Registry" icon="address-book" href="/protocol/meta-address-registry">
+    Stealth identity name resolution
+  </Card>
+</CardGroup>
+
+<CardGroup cols={2}>
+  <Card title="Announcements" icon="bullhorn" href="/protocol/announcements">
+    Stealth payment detection events
+  </Card>
+  <Card title="Intent" icon="signature" href="/protocol/intent">
+    Ed25519 signature verification
+  </Card>
+  <Card title="Receipt" icon="receipt" href="/protocol/receipt">
+    Encrypted transaction receipts
+  </Card>
+  <Card title="Warranty" icon="shield-check" href="/protocol/warranty">
+    Transferable warranty NFTs
+  </Card>
+</CardGroup>
+
+<CardGroup cols={2}>
+  <Card title="ZK Verifier" icon="lock" href="/protocol/zk-verifier">
+    Groth16 proof verification
+  </Card>
+</CardGroup>
+
+## Contract Flow
+
+A typical identiPay transaction flows through multiple contracts:
+
+<Steps>
+  <Step title="Merchant Registration">
+    Merchant registers in the **Trust Registry** with their DID, public key, and Sui address.
+  </Step>
+  
+  <Step title="User Identity Setup">
+    User registers a name in the **Meta-Address Registry** using a ZK proof of government credentials.
+  </Step>
+  
+  <Step title="Commerce Proposal">
+    Merchant creates a signed proposal containing amount, items, and constraints.
+  </Step>
+  
+  <Step title="User Intent Signing">
+    User signs the intent hash with their Ed25519 key, verified by the **Intent** module.
+  </Step>
+  
+  <Step title="Atomic Settlement">
+    The **Settlement** contract executes atomically:
+    - Verifies ZK proof via **ZK Verifier** (if age-gated)
+    - Verifies intent signature via **Intent**
+    - Transfers payment to merchant
+    - Mints encrypted **Receipt** to buyer's stealth address
+    - Optionally mints **Warranty**
+    - Emits **Announcement** for payment detection
+  </Step>
+  
+  <Step title="Privacy Enhancement (Optional)">
+    User deposits coins into the **Shielded Pool** to break transaction linkability.
+  </Step>
+</Steps>
+
+## Key Design Principles
+
+<AccordionGroup>
+  <Accordion title="Privacy First" icon="eye-slash">
+    - All payments use one-time stealth addresses
+    - Receipts and warranties are encrypted on-chain
+    - Shielded pools break address clustering
+    - Zero-knowledge proofs reveal only necessary predicates
+  </Accordion>
+  
+  <Accordion title="Atomic Execution" icon="atom">
+    The settlement contract uses Programmable Transaction Blocks (PTBs) to ensure either all operations succeed or all fail. No partial settlements.
+  </Accordion>
+  
+  <Accordion title="Replay Protection" icon="shield">
+    Intent hashes are tracked in the settlement state to prevent double-spending of signed intents.
+  </Accordion>
+  
+  <Accordion title="Generic Token Support" icon="coins">
+    Most contracts are generic over token type `<T>`, supporting USDC, SUI, or any Sui coin.
+  </Accordion>
+  
+  <Accordion title="Event-Driven Detection" icon="radar">
+    Payment detection uses Sui events rather than address scanning, enabling efficient stealth address detection.
+  </Accordion>
+</AccordionGroup>
+
+## Module Structure
+
+```move
+module identipay::settlement    // Core orchestrator
+module identipay::shielded_pool // Privacy mixer
+module identipay::trust_registry // Merchant verification
+module identipay::meta_address_registry // Name resolution
+module identipay::announcements  // Payment detection
+module identipay::intent         // Signature verification
+module identipay::receipt        // Transaction receipts
+module identipay::warranty       // Warranty NFTs
+module identipay::zk_verifier    // ZK proof verification
+```
+
+## Deployment
+
+All contracts are deployed as a single Move package with the `identipay` namespace. Shared objects (registries, pools, settlement state) are created during the `init` function and made globally accessible.
+
+<Note>
+  The contracts are designed for Sui's object model, using owned objects for user assets (receipts, warranties, meta-address entries) and shared objects for protocol state (registries, pools, settlement state).
+</Note>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Integration Guide" icon="code" href="/integration/merchant-overview">
+    Learn how to integrate with these contracts
+  </Card>
+  <Card title="API Reference" icon="book" href="/api/introduction">
+    Explore the full API documentation
+  </Card>
+</CardGroup>

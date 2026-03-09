@@ -1,0 +1,371 @@
+---
+title: 'Names'
+description: 'Name registration and resolution endpoints'
+---
+
+## Overview
+
+The names API provides a privacy-preserving name system for stealth addresses. Users can register human-readable names (e.g., "alice") that resolve to meta-address public keys.
+
+<Warning>
+  Name resolution returns ONLY `spendPubkey` and `viewPubkey`, never a Sui address. This preserves privacy.
+</Warning>
+
+## Endpoints
+
+### Resolve Name
+
+Resolve a name to meta-address public keys.
+
+```http
+GET /api/identipay/v1/names/:name
+```
+
+#### Path Parameters
+
+<ParamField path="name" type="string" required>
+  Name to resolve (3-20 characters)
+</ParamField>
+
+#### Response
+
+<ResponseField name="name" type="string">
+  The resolved name
+</ResponseField>
+
+<ResponseField name="spendPubkey" type="string">
+  Spend public key (hex string)
+</ResponseField>
+
+<ResponseField name="viewPubkey" type="string">
+  View public key (hex string)
+</ResponseField>
+
+<Info>
+  Sui addresses are NEVER returned to preserve privacy.
+</Info>
+
+#### Example Request
+
+<CodeGroup>
+```bash cURL
+curl https://api.identipay.com/api/identipay/v1/names/alice
+```
+
+```typescript TypeScript
+const response = await fetch(
+  'https://api.identipay.com/api/identipay/v1/names/alice'
+);
+const metaAddress = await response.json();
+```
+</CodeGroup>
+
+#### Example Response
+
+```json
+{
+  "name": "alice",
+  "spendPubkey": "a1b2c3d4e5f6...",
+  "viewPubkey": "f6e5d4c3b2a1..."
+}
+```
+
+#### Error Responses
+
+<Expandable title="404 Not Found">
+  Name is not registered.
+  
+  ```json
+  {
+    "error": {
+      "code": "NOT_FOUND",
+      "message": "Name \"alice\" not found"
+    }
+  }
+  ```
+</Expandable>
+
+---
+
+### Register Name
+
+Register a new name with stealth meta-address and ZK identity proof.
+
+```http
+POST /api/identipay/v1/names/register
+```
+
+<Info>
+  The backend builds the registration transaction, sponsors gas, and submits it on-chain.
+</Info>
+
+#### Request Body
+
+<ParamField body="name" type="string" required>
+  Name to register (3-20 characters)
+</ParamField>
+
+<ParamField body="spendPubkey" type="string" required>
+  Spend public key (hex string)
+</ParamField>
+
+<ParamField body="viewPubkey" type="string" required>
+  View public key (hex string)
+</ParamField>
+
+<ParamField body="identityCommitment" type="string" required>
+  Identity commitment (32 bytes hex)
+</ParamField>
+
+<ParamField body="zkProof" type="string" required>
+  Groth16 ZK proof (256 bytes hex)
+</ParamField>
+
+<ParamField body="zkPublicInputs" type="string" required>
+  ZK public inputs (N * 32 bytes hex)
+</ParamField>
+
+#### Response
+
+<ResponseField name="txDigest" type="string">
+  Sui transaction digest of the registration
+</ResponseField>
+
+#### Example Request
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.identipay.com/api/identipay/v1/names/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "alice",
+    "spendPubkey": "a1b2c3d4e5f6...",
+    "viewPubkey": "f6e5d4c3b2a1...",
+    "identityCommitment": "c0mm1tm3nt...",
+    "zkProof": "pr00f...",
+    "zkPublicInputs": "1nput5..."
+  }'
+```
+
+```typescript TypeScript
+const response = await fetch(
+  'https://api.identipay.com/api/identipay/v1/names/register',
+  {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'alice',
+      spendPubkey: 'a1b2c3d4e5f6...',
+      viewPubkey: 'f6e5d4c3b2a1...',
+      identityCommitment: 'c0mm1tm3nt...',
+      zkProof: 'pr00f...',
+      zkPublicInputs: '1nput5...'
+    })
+  }
+);
+const { txDigest } = await response.json();
+```
+</CodeGroup>
+
+#### Example Response
+
+```json
+{
+  "txDigest": "9x4Kb2FgH8..."
+}
+```
+
+#### Error Responses
+
+<Expandable title="400 Validation Error">
+  Invalid registration input.
+  
+  ```json
+  {
+    "error": {
+      "code": "VALIDATION_ERROR",
+      "message": "Invalid registration input",
+      "details": {
+        "fieldErrors": {
+          "name": ["String must contain at least 3 character(s)"],
+          "spendPubkey": ["Invalid"]
+        }
+      }
+    }
+  }
+  ```
+</Expandable>
+
+<Expandable title="409 Conflict">
+  Name already registered (on-chain conflict).
+  
+  ```json
+  {
+    "error": {
+      "code": "CONFLICT",
+      "message": "Name is already registered"
+    }
+  }
+  ```
+</Expandable>
+
+<Expandable title="500 Sui Error">
+  Failed to submit registration transaction.
+  
+  ```json
+  {
+    "error": {
+      "code": "SUI_ERROR",
+      "message": "Failed to register name on-chain",
+      "details": {...}
+    }
+  }
+  ```
+</Expandable>
+
+## Implementation Details
+
+### Name Resolution Flow
+
+When resolving a name (see `routes/names.ts:14-61`):
+
+1. **Check Cache**: Query database for cached name
+2. **Return Cached**: If found, return `spendPubkey` and `viewPubkey`
+3. **On-Chain Lookup**: If not cached, call `suiService.resolveName()`
+4. **Store Cache**: Cache result in database
+5. **Return Result**: Return public keys only (no Sui address)
+
+### Privacy Invariants
+
+<Warning>
+  The backend NEVER returns Sui addresses, even though they exist on-chain.
+</Warning>
+
+This ensures:
+- Senders cannot link names to blockchain addresses
+- Name lookups don't reveal user balances
+- On-chain activity remains unlinkable to names
+
+### Registration Flow
+
+When registering a name (see `routes/names.ts:66-104`):
+
+1. **Validate Input**: Check name format, public key formats, ZK proof
+2. **Build Transaction**: Construct registration transaction with ZK proof
+3. **Submit On-Chain**: Backend signs with admin key (gas sponsor) and submits
+4. **Cache Result**: Store name and public keys in database
+5. **Return Digest**: Return Sui transaction digest
+
+<Info>
+  The backend builds and submits the transaction. Wallets don't need to sign (privacy benefit).
+</Info>
+
+### ZK Identity Proof
+
+Name registration requires a zero-knowledge proof that:
+- The registrant owns a valid identity credential
+- The credential's commitment matches `identityCommitment`
+- The proof doesn't reveal any identity attributes
+
+This prevents spam/sybil attacks while preserving anonymity.
+
+### Caching Strategy
+
+Names are cached in the database after first resolution:
+
+```typescript
+await db
+  .insert(names)
+  .values({
+    name,
+    spendPubkey,
+    viewPubkey,
+    identityCommitment
+  })
+  .onConflictDoUpdate({
+    target: names.name,
+    set: {
+      spendPubkey,
+      viewPubkey,
+      updatedAt: new Date()
+    }
+  });
+```
+
+Cache updates:
+- On first resolution from on-chain
+- On registration
+- On conflict resolution (upsert)
+
+### Database Schema
+
+The `names` table stores:
+
+```sql
+CREATE TABLE names (
+  name TEXT PRIMARY KEY,
+  spend_pubkey TEXT NOT NULL,
+  view_pubkey TEXT NOT NULL,
+  identity_commitment TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW(),
+  updated_at TIMESTAMP DEFAULT NOW()
+);
+```
+
+<Info>
+  No Sui address is stored, preserving privacy.
+</Info>
+
+## Use Cases
+
+### Payment Request
+
+A merchant can create a payment request using a name:
+
+```typescript
+// Merchant creates request
+const request = await createPayRequest({
+  recipientName: 'alice',
+  amount: '10.00',
+  currency: 'USDC'
+});
+
+// Payer's wallet resolves name
+const { spendPubkey, viewPubkey } = await resolveName('alice');
+
+// Payer computes stealth address
+const stealthAddr = computeStealthAddress(spendPubkey, viewPubkey);
+
+// Payer sends to stealth address
+await sendToStealth(stealthAddr, ...);
+```
+
+### Direct Send
+
+Users can send directly to a name:
+
+```typescript
+// Resolve recipient name
+const metaAddr = await fetch('/api/identipay/v1/names/bob').then(r => r.json());
+
+// Generate stealth address
+const { stealthAddr, ephemeralPubkey, viewTag } = generateStealthAddress(
+  metaAddr.spendPubkey,
+  metaAddr.viewPubkey
+);
+
+// Build and send transaction
+const { txBytes } = await buildSponsoredSend({
+  type: 'send',
+  recipient: stealthAddr,
+  amount: '1000000000',
+  ephemeralPubkey,
+  viewTag
+});
+```
+
+## Related Endpoints
+
+- [Pay Requests](/api/pay-requests) - Create payment requests by name
+- [Announcements](/api/announcements) - Query stealth address announcements
+- [Transactions](/api/transactions) - Send to stealth addresses

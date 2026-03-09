@@ -1,0 +1,247 @@
+---
+title: Merchant Integration Overview
+description: Get started with identiPay as a merchant to accept privacy-preserving payments
+---
+
+## Introduction
+
+identiPay enables merchants to accept privacy-preserving payments on the Sui blockchain using zero-knowledge proofs and stealth addresses. This guide covers the prerequisites and registration process for merchants.
+
+## How identiPay Works
+
+identiPay provides a complete privacy-preserving payment protocol:
+
+1. **Stealth Addresses**: Each payment uses a unique, one-time address that cannot be linked to the buyer's identity
+2. **Zero-Knowledge Proofs**: Age verification and compliance checks without revealing personal information
+3. **Atomic Settlement**: Payment and receipt delivery happen in a single blockchain transaction
+4. **Encrypted Receipts**: Purchase details are encrypted and delivered only to the buyer
+
+<Steps>
+  <Step title="Register with Trust Registry">
+    Submit your merchant information to be registered on-chain in the identiPay trust registry.
+  </Step>
+  
+  <Step title="Receive API Credentials">
+    Get your unique API key and DID (Decentralized Identifier) for authentication.
+  </Step>
+  
+  <Step title="Integrate Checkout">
+    Add identiPay checkout to your website or application.
+  </Step>
+  
+  <Step title="Monitor Settlements">
+    Use WebSocket API to receive real-time payment confirmations.
+  </Step>
+</Steps>
+
+## Prerequisites
+
+Before integrating identiPay, you need:
+
+### 1. Sui Wallet Address
+
+A Sui blockchain address where you'll receive payments. You can create one using:
+- [Sui Wallet](https://chrome.google.com/webstore/detail/sui-wallet) (Browser extension)
+- [Suiet](https://suiet.app/) (Multi-chain wallet)
+- Sui CLI: `sui client new-address ed25519`
+
+<Note>
+Your Sui address should follow the format: `0x` followed by 64 hexadecimal characters.
+</Note>
+
+### 2. Public Key
+
+A 64-character hex-encoded public key for encryption and signature verification. This is used for:
+- Encrypting receipts sent to buyers
+- Verifying proposal authenticity
+- Securing WebSocket connections
+
+### 3. Verified Hostname
+
+A domain you control where the identiPay API will be accessible. For example:
+- `shop.example.com`
+- `payments.yourstore.io`
+
+<Warning>
+You must have SSL/TLS configured for your hostname. identiPay requires HTTPS for all API endpoints.
+</Warning>
+
+## Registration Process
+
+Register your merchant account with the identiPay trust registry:
+
+### API Endpoint
+
+```
+POST https://api.identipay.net/api/identipay/v1/merchants/register
+```
+
+### Request Body
+
+<ParamField body="name" type="string" required>
+  Your business name as it will appear to customers (1-255 characters)
+</ParamField>
+
+<ParamField body="suiAddress" type="string" required>
+  Your Sui blockchain address where payments will be received
+  
+  Format: `0x` followed by 64 hexadecimal characters
+</ParamField>
+
+<ParamField body="hostname" type="string" required>
+  Your verified domain name without protocol (e.g., `shop.example.com`)
+</ParamField>
+
+<ParamField body="publicKey" type="string" required>
+  64-character hex-encoded public key for encryption
+</ParamField>
+
+### Example Registration
+
+<CodeGroup>
+
+```typescript Node.js
+const response = await fetch(
+  'https://api.identipay.net/api/identipay/v1/merchants/register',
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      name: 'TechVault',
+      suiAddress: '0x9f9a52525712f64c6225f076857cb5c32096c203a499760f43749ee360d4a5fa',
+      hostname: 'techvault.store',
+      publicKey: 'a6317b7521f98e96e8ac16dab916af8fdc3f65be3e7305954f219f6ca64dcdb5',
+    }),
+  }
+);
+
+const result = await response.json();
+console.log('Merchant ID:', result.id);
+console.log('DID:', result.did);
+console.log('API Key:', result.apiKey);
+```
+
+```python Python
+import requests
+
+response = requests.post(
+    'https://api.identipay.net/api/identipay/v1/merchants/register',
+    json={
+        'name': 'TechVault',
+        'suiAddress': '0x9f9a52525712f64c6225f076857cb5c32096c203a499760f43749ee360d4a5fa',
+        'hostname': 'techvault.store',
+        'publicKey': 'a6317b7521f98e96e8ac16dab916af8fdc3f65be3e7305954f219f6ca64dcdb5',
+    }
+)
+
+result = response.json()
+print(f"Merchant ID: {result['id']}")
+print(f"DID: {result['did']}")
+print(f"API Key: {result['apiKey']}")
+```
+
+```bash cURL
+curl -X POST https://api.identipay.net/api/identipay/v1/merchants/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "TechVault",
+    "suiAddress": "0x9f9a52525712f64c6225f076857cb5c32096c203a499760f43749ee360d4a5fa",
+    "hostname": "techvault.store",
+    "publicKey": "a6317b7521f98e96e8ac16dab916af8fdc3f65be3e7305954f219f6ca64dcdb5"
+  }'
+```
+
+</CodeGroup>
+
+### Response
+
+```json
+{
+  "id": "ccd20e4a-ae80-49f3-862c-2f05c2714d1b",
+  "did": "did:identipay:techvault.store:ccd20e4a-ae80-49f3-862c-2f05c2714d1b",
+  "apiKey": "idpay_sk_1a2b3c4d5e6f7g8h9i0j"
+}
+```
+
+<ParamField body="id" type="string">
+  Unique merchant identifier (UUID)
+</ParamField>
+
+<ParamField body="did" type="string">
+  Your decentralized identifier in the format:
+  
+  `did:identipay:<hostname>:<merchant-id>`
+</ParamField>
+
+<ParamField body="apiKey" type="string">
+  Your API key for authenticated requests. **Store this securely** - it cannot be recovered.
+</ParamField>
+
+<Warning>
+**Store your API key securely!**
+
+The API key is only shown once during registration. Store it in a secure location such as:
+- Environment variables
+- Secret management service (AWS Secrets Manager, HashiCorp Vault, etc.)
+- Encrypted configuration files
+
+Never commit API keys to version control or expose them in client-side code.
+</Warning>
+
+## On-Chain Registration
+
+When you register, the following happens on the Sui blockchain:
+
+1. **Trust Registry Entry**: Your merchant information is written to the on-chain trust registry
+2. **DID Association**: Your DID is linked to your Sui address and public key
+3. **Verification Status**: Your merchant account is activated and ready to accept payments
+
+Customers' wallets verify merchant authenticity by checking the trust registry before completing payments.
+
+## Authentication
+
+All merchant API requests require authentication using your API key:
+
+```typescript
+const response = await fetch(
+  'https://api.identipay.net/api/identipay/v1/proposals',
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.IDENTIPAY_API_KEY}`,
+    },
+    body: JSON.stringify(proposalData),
+  }
+);
+```
+
+<Note>
+The API key should be sent in the `Authorization` header as a Bearer token.
+</Note>
+
+## Rate Limits
+
+API rate limits are applied per merchant:
+
+- **Proposal Creation**: 100 requests per minute
+- **Status Checks**: 300 requests per minute
+- **WebSocket Connections**: 50 concurrent connections
+
+If you exceed rate limits, you'll receive a `429 Too Many Requests` response.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Checkout Integration" icon="cart-shopping" href="/integration/checkout-integration">
+    Add identiPay checkout to your website
+  </Card>
+  <Card title="Payment Flow" icon="arrow-right-arrow-left" href="/integration/payment-flow">
+    Understand the complete payment lifecycle
+  </Card>
+  <Card title="WebSocket API" icon="satellite-dish" href="/integration/webhooks">
+    Receive real-time payment notifications
+  </Card>
+</CardGroup>

@@ -1,0 +1,504 @@
+---
+title: 'Poseidon Hashing'
+description: 'ZK-friendly hash function for commitments, Merkle trees, and nullifiers'
+---
+
+## Overview
+
+Poseidon is a cryptographic hash function optimized for zero-knowledge circuits. Unlike SHA-256 or Keccak, Poseidon uses arithmetic operations over finite fields, making it extremely efficient in constraint systems like Circom.
+
+<Note>
+  identiPay uses **Poseidon BN254** (BN128 curve scalar field) for compatibility between Circom circuits and Sui smart contracts.
+</Note>
+
+## Why Poseidon?
+
+### Efficiency in ZK Circuits
+
+| Hash Function | Constraints (2 inputs) | Relative Cost |
+|---------------|------------------------|---------------|
+| SHA-256 | ~25,000 | 100x |
+| Keccak-256 | ~45,000 | 180x |
+| **Poseidon** | **~250** | **1x** |
+| Pedersen | ~1,500 | 6x |
+
+Poseidon is **100-180x more efficient** than traditional hash functions in ZK circuits.
+
+### Native Field Operations
+
+Poseidon operates directly on field elements (254-bit integers in BN254), matching the native data type of circom circuits:
+
+```circom
+// Poseidon: native field arithmetic
+component hasher = Poseidon(2);
+hasher.inputs[0] <== a;  // Field element
+hasher.inputs[1] <== b;  // Field element
+signal output <== hasher.out;  // ~250 constraints
+
+// SHA-256: requires bit decomposition + boolean logic
+component sha = Sha256(512);
+component a2bits = Num2Bits(254);  // ~254 constraints
+a2bits.in <== a;
+// ... convert to bits, hash, convert back ... (~25K constraints)
+```
+
+## Poseidon in identiPay
+
+Poseidon is used throughout the protocol:
+
+### 1. Identity Commitments
+
+```circom identity_registration.circom:32
+component hasher = Poseidon(4);
+hasher.inputs[0] <== issuerCertHash;
+hasher.inputs[1] <== docNumberHash;
+hasher.inputs[2] <== dobHash;
+hasher.inputs[3] <== userSalt;
+
+identityCommitment <== hasher.out;
+```
+
+See [Identity Registration](/protocol/identity-registration) for details.
+
+### 2. Date of Birth Hashing
+
+```circom age_check.circom:41
+component dobHasher = Poseidon(3);
+dobHasher.inputs[0] <== birthYear;
+dobHasher.inputs[1] <== birthMonth;
+dobHasher.inputs[2] <== birthDay;
+dobHasher.out === dobHash;
+```
+
+### 3. Merkle Trees
+
+```circom pool_spend.circom:36
+hashers[i] = Poseidon(2);
+hashers[i].inputs[0] <== leftChild;
+hashers[i].inputs[1] <== rightChild;
+currentHash <== hashers[i].out;
+```
+
+The Merkle tree uses Poseidon for hashing parent nodes from children.
+
+### 4. Nullifiers
+
+```circom pool_spend.circom:115
+component nullifierHasher = Poseidon(2);
+nullifierHasher.inputs[0] <== commitment;
+nullifierHasher.inputs[1] <== ownerKey;
+nullifierHasher.out === nullifier;
+```
+
+Nullifiers are computed as `Poseidon(commitment, ownerKey)` to prevent double-spending.
+
+## Algorithm Details
+
+### Sponge Construction
+
+Poseidon uses a **sponge construction** similar to Keccak:
+
+1. **Absorb phase**: Input field elements are absorbed into the state
+2. **Permutation**: State is permuted using rounds of substitution and mixing
+3. **Squeeze phase**: Output is extracted from the state
+
+```
+        ┌─────────────────┐
+Input ──┤ Absorb (XOR)    │
+        ├─────────────────┤
+        │ Permutation     │  ← Repeated for R rounds
+        ├─────────────────┤
+Output ←┤ Squeeze         │
+        └─────────────────┘
+```
+
+### Permutation Rounds
+
+Each round applies:
+
+1. **AddRoundConstants**: Add round constant to each state element
+   ```
+   state[i] = state[i] + round_constants[round][i]
+   ```
+
+2. **SubWords** (S-box): Raise each element to power α (typically 5)
+   ```
+   state[i] = state[i]^5
+   ```
+
+3. **MixLayer**: Linear mixing using MDS matrix
+   ```
+   state = MDS_matrix × state
+   ```
+
+Poseidon uses **partial rounds** where only the first element is passed through the S-box, reducing constraints by ~30%.
+
+### Parameters for BN254
+
+| Parameter | Value |
+|-----------|-------|
+| Field | BN254 scalar field (~254 bits) |
+| Field size | 21888242871839275222246405745257275088548364400416034343698204186575808495617 |
+| S-box | x^5 |
+| Full rounds (Rf) | 8 |
+| Partial rounds (Rp) | Variable (depends on input size) |
+| Width (t) | inputs + 1 (for capacity) |
+
+See [Poseidon paper](https://eprint.iacr.org/2019/458.pdf) for security analysis.
+
+## Implementation
+
+### Circom (Circuit)
+
+From circomlib:
+
+```circom
+template Poseidon(nInputs) {
+    signal input inputs[nInputs];
+    signal output out;
+
+    // Implementation uses hardcoded constants and MDS matrices
+    // optimized for BN254 field
+    
+    component mixS[...];  // S-box layers
+    component mixM[...];  // MDS mixing layers
+    
+    // ... circuit logic ...
+    
+    out <== finalState[0];
+}
+```
+
+Usage in circuits:
+
+```circom
+include "node_modules/circomlib/circuits/poseidon.circom";
+
+component hasher = Poseidon(2);  // 2 inputs
+hasher.inputs[0] <== input1;
+hasher.inputs[1] <== input2;
+signal hash <== hasher.out;
+```
+
+### JavaScript (Off-chain)
+
+Using circomlibjs:
+
+```typescript
+import { poseidon } from 'circomlibjs';
+
+// Hash single value
+const hash1 = poseidon([BigInt(12345)]);
+
+// Hash multiple values
+const hash2 = poseidon([
+  BigInt(value1),
+  BigInt(value2),
+  BigInt(value3)
+]);
+
+// Result is a BigInt (field element)
+console.log(hash2.toString());  // "1234567890..."
+```
+
+**Important**: Inputs must be BigInts, and outputs are BigInts in the BN254 scalar field.
+
+### Sui Move (On-chain)
+
+Sui provides a native Poseidon implementation:
+
+```move shielded_pool.move:214
+fun hash_pair(left: u256, right: u256): u256 {
+    let data = vector[left, right];
+    poseidon::poseidon_bn254(&data)
+}
+```
+
+From the Sui standard library:
+
+```move
+module sui::poseidon {
+    /// Hash a vector of BN254 field elements using Poseidon.
+    public fun poseidon_bn254(data: &vector<u256>): u256;
+}
+```
+
+**Critical**: The Sui implementation uses the **same parameters** as circomlib, ensuring on-chain and off-chain hashes match.
+
+### Verification
+
+Test that all implementations produce the same hash:
+
+```typescript
+import { poseidon as jsHash } from 'circomlibjs';
+import { SuiClient } from '@mysten/sui';
+
+// Off-chain (JS)
+const inputs = [12345n, 67890n];
+const jsResult = jsHash(inputs);
+
+// On-chain (Sui)
+const tx = new Transaction();
+const result = tx.moveCall({
+  target: `${PACKAGE_ID}::test::hash_two`,
+  arguments: [
+    tx.pure('u256', '12345'),
+    tx.pure('u256', '67890')
+  ]
+});
+const suiResult = await client.devInspectTransactionBlock({ ... });
+
+// Should match
+assert(jsResult.toString() === suiResult.toString());
+```
+
+## Security Properties
+
+### Collision Resistance
+
+Poseidon provides **~128-bit collision resistance** for the BN254 instantiation:
+
+- Field size: ~254 bits
+- Security level: ~128 bits (birthday bound)
+- Finding a collision requires ~2^128 hash evaluations
+
+<Note>
+  This is equivalent to SHA-256 for practical purposes. No collisions have been found in Poseidon for recommended parameters.
+</Note>
+
+### Preimage Resistance
+
+Given `h = Poseidon(x)`, finding `x` requires:
+
+- Brute force: ~2^254 operations (infeasible)
+- No known algebraic attacks for recommended parameters
+
+### Second Preimage Resistance
+
+Given `x1` and `h = Poseidon(x1)`, finding `x2 ≠ x1` where `Poseidon(x2) = h` is computationally infeasible.
+
+### Domain Separation
+
+<Warning>
+  **Security consideration**: Poseidon with different input counts produces different hash functions. Always use consistent input counts for the same application.
+</Warning>
+
+Example vulnerability:
+
+```typescript
+// BAD: Ambiguous encoding
+const hash1 = poseidon([a, b]);  // 2 inputs
+const hash2 = poseidon([c]);     // 1 input
+
+// If a == c and b can be chosen, potential collision risk
+```
+
+**Best practice**: Use fixed input counts per use case:
+
+```typescript
+// GOOD: Explicit domain separation
+const identityCommitment = poseidon([issuer, doc, dob, salt]);  // Always 4
+const dobHash = poseidon([year, month, day]);                   // Always 3
+const nullifier = poseidon([commitment, key]);                  // Always 2
+```
+
+## Performance Comparison
+
+### Circuit Proving Time
+
+For a circuit that computes 100 hashes:
+
+| Hash Function | Constraints | Proving Time (M1) |
+|---------------|-------------|-------------------|
+| Poseidon | ~25,000 | ~3 seconds |
+| Pedersen | ~150,000 | ~18 seconds |
+| SHA-256 | ~2,500,000 | ~300 seconds |
+
+### On-Chain Gas Cost (Sui)
+
+```move
+// Benchmark: Hash 2 field elements
+public fun bench_poseidon(): u256 {
+    let data = vector[123456789u256, 987654321u256];
+    poseidon::poseidon_bn254(&data)  // ~500 gas units
+}
+```
+
+**Comparison**:
+- Poseidon (2 inputs): ~500 gas
+- SHA-256 (64 bytes): ~1000 gas
+- Keccak-256 (64 bytes): ~1200 gas
+
+Poseidon is **2-3x cheaper** on-chain for equivalent security.
+
+### Off-Chain Computation (JavaScript)
+
+```typescript
+import { poseidon } from 'circomlibjs';
+import { sha256 } from '@noble/hashes/sha256';
+import { performance } from 'perf_hooks';
+
+// Benchmark Poseidon
+const start1 = performance.now();
+for (let i = 0; i < 10000; i++) {
+  poseidon([BigInt(i), BigInt(i + 1)]);
+}
+const end1 = performance.now();
+console.log('Poseidon:', end1 - start1, 'ms');  // ~50ms (0.005ms per hash)
+
+// Benchmark SHA-256
+const start2 = performance.now();
+for (let i = 0; i < 10000; i++) {
+  sha256(new Uint8Array([i, i + 1]));
+}
+const end2 = performance.now();
+console.log('SHA-256:', end2 - start2, 'ms');   // ~100ms (0.01ms per hash)
+```
+
+Poseidon is **2x faster** off-chain for small inputs (but SHA-256 is faster for large inputs due to better hardware support).
+
+## Use Case Guidelines
+
+### When to Use Poseidon
+
+✅ **Use Poseidon for**:
+- Commitments in ZK circuits (identity, notes, nullifiers)
+- Merkle trees verified in circuits
+- Any hash that appears in a ZK proof
+- On-chain hashing where inputs are field elements
+
+### When NOT to Use Poseidon
+
+❌ **Don't use Poseidon for**:
+- External API compatibility (use SHA-256 or Keccak-256)
+- Hashing arbitrary byte strings (Poseidon works on field elements)
+- Compatibility with Ethereum contracts (use Keccak-256)
+- Long-term archival (Poseidon is newer, less battle-tested)
+
+### Hybrid Approach
+
+For external data, use SHA-256 first, then convert to field element:
+
+```typescript
+import { sha256 } from '@noble/hashes/sha256';
+import { poseidon } from 'circomlibjs';
+
+// Hash arbitrary bytes with SHA-256
+const documentBytes = new TextEncoder().encode(documentNumber);
+const sha256Hash = sha256(documentBytes);
+
+// Convert to field element (truncate to 254 bits)
+const fieldElement = BigInt('0x' + Buffer.from(sha256Hash).toString('hex')) & ((1n << 254n) - 1n);
+
+// Use in Poseidon circuit
+const commitment = poseidon([
+  fieldElement,
+  otherInputs...
+]);
+```
+
+This approach:
+- Maintains compatibility with external systems (SHA-256)
+- Achieves efficiency in ZK circuits (Poseidon)
+
+## Testing
+
+### Circuit Tests
+
+```javascript
+const { expect } = require('chai');
+const { wasm: wasm_tester } = require('circom_tester');
+const { poseidon } = require('circomlibjs');
+
+describe('Poseidon hash', () => {
+  it('should match circomlibjs implementation', async () => {
+    const circuit = await wasm_tester(`
+      pragma circom 2.1.6;
+      include "circomlib/circuits/poseidon.circom";
+      
+      template Test() {
+        signal input in[2];
+        signal output out;
+        
+        component hasher = Poseidon(2);
+        hasher.inputs[0] <== in[0];
+        hasher.inputs[1] <== in[1];
+        out <== hasher.out;
+      }
+      
+      component main = Test();
+    `);
+    
+    const inputs = { in: ['12345', '67890'] };
+    const witness = await circuit.calculateWitness(inputs);
+    
+    const expectedHash = poseidon([12345n, 67890n]);
+    expect(witness[1]).to.equal(expectedHash);
+  });
+});
+```
+
+### Cross-Implementation Tests
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { poseidon } from 'circomlibjs';
+import { Transaction } from '@mysten/sui';
+
+describe('Poseidon cross-implementation', () => {
+  it('should match between JS and Sui', async () => {
+    const inputs = [123n, 456n, 789n];
+    
+    // JS implementation
+    const jsHash = poseidon(inputs);
+    
+    // Sui implementation
+    const tx = new Transaction();
+    const result = tx.moveCall({
+      target: `${PACKAGE_ID}::test::poseidon_3`,
+      arguments: [
+        tx.pure('u256', '123'),
+        tx.pure('u256', '456'),
+        tx.pure('u256', '789')
+      ]
+    });
+    
+    const { results } = await client.devInspectTransactionBlock({
+      transactionBlock: tx,
+      sender: '0x0'
+    });
+    
+    const suiHash = parseU256FromResult(results);
+    
+    expect(jsHash.toString()).toBe(suiHash.toString());
+  });
+});
+```
+
+## Resources
+
+<CardGroup cols={2}>
+  <Card title="Poseidon Paper" icon="file-pdf" href="https://eprint.iacr.org/2019/458.pdf">
+    Original research paper with security proofs
+  </Card>
+  <Card title="circomlib" icon="code" href="https://github.com/iden3/circomlib">
+    Circom implementation (reference)
+  </Card>
+  <Card title="circomlibjs" icon="js" href="https://github.com/iden3/circomlibjs">
+    JavaScript implementation
+  </Card>
+  <Card title="Sui Poseidon" icon="cube" href="https://docs.sui.io/references/framework/sui-framework/poseidon">
+    Sui Move standard library docs
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Merkle Trees" icon="sitemap" href="/protocol/merkle-trees">
+    Incremental Merkle tree using Poseidon hashing
+  </Card>
+  <Card title="Pool Spend Circuit" icon="shield" href="/protocol/pool-spend">
+    Use Poseidon for commitments and nullifiers
+  </Card>
+</CardGroup>

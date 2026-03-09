@@ -1,0 +1,482 @@
+---
+title: "ZK Verifier Contract"
+description: "Groth16 proof verification for zero-knowledge eligibility checks"
+---
+
+## Overview
+
+The ZK Verifier contract (`identipay::zk_verifier`) implements zero-knowledge proof verification using **Groth16 over BN254**. It enables privacy-preserving eligibility checks such as age verification without revealing personal information.
+
+Per the whitepaper section 4.6, proofs are bound to the intent hash to prevent replay attacks. The verifier learns only the predicate truth (e.g., "age >= 21") without seeing the underlying attributes (actual birthdate, name, etc.).
+
+## Source Code
+
+Location: `contracts/sources/zk_verifier.move:8`
+
+## Data Structures
+
+### VerificationKey
+
+Stores a prepared verification key for a specific ZK circuit.
+
+<ParamField body="id" type="UID" required>
+  Sui object identifier
+</ParamField>
+
+<ParamField body="circuit_name" type="String" required>
+  Human-readable circuit identifier (e.g., "age_check", "identity_registration", "pool_spend")
+</ParamField>
+
+<ParamField body="pvk" type="groth16::PreparedVerifyingKey" required>
+  Pre-processed verifying key for efficient verification
+</ParamField>
+
+```move
+public struct VerificationKey has key, store {
+    id: UID,
+    circuit_name: std::string::String,
+    pvk: groth16::PreparedVerifyingKey,
+}
+```
+
+## Public Functions
+
+### create_verification_key
+
+Create and share a new verification key for a ZK circuit. Called once during deployment to register each circuit.
+
+**Function Signature:**
+
+```move
+public fun create_verification_key(
+    circuit_name: std::string::String,
+    raw_vk: vector<u8>,
+    ctx: &mut TxContext,
+)
+```
+
+<ParamField path="circuit_name" type="String" required>
+  Human-readable identifier for the circuit
+</ParamField>
+
+<ParamField path="raw_vk" type="vector<u8>" required>
+  Serialized Groth16 verification key from the circuit's trusted setup
+</ParamField>
+
+**Location:** `zk_verifier.move:36-51`
+
+**Example:**
+
+<CodeGroup>
+
+```typescript Deploy Verification Key
+import { TransactionBlock } from '@mysten/sui.js/transactions';
+import * as fs from 'fs';
+
+// Load verification key from circuit compilation
+const vkJson = JSON.parse(
+  fs.readFileSync('./circuits/age_check/verification_key.json', 'utf8')
+);
+
+// Serialize to bytes (circuit-specific format)
+const rawVk = serializeGroth16Vk(vkJson);
+
+// Deploy to Sui
+const tx = new TransactionBlock();
+tx.moveCall({
+  target: `${PACKAGE_ID}::zk_verifier::create_verification_key`,
+  arguments: [
+    tx.pure('age_check'),
+    tx.pure(Array.from(rawVk)),
+  ],
+});
+
+const result = await adminWallet.signAndExecuteTransactionBlock({
+  transactionBlock: tx,
+});
+
+const vkObjectId = result.objectChanges.find(
+  (change) => change.type === 'created'
+).objectId;
+
+console.log('Verification key deployed:', vkObjectId);
+```
+
+</CodeGroup>
+
+### verify_proof
+
+Verify a Groth16 proof against the stored verification key. Returns `true` if valid, `false` otherwise.
+
+**Function Signature:**
+
+```move
+public(package) fun verify_proof(
+    vk: &VerificationKey,
+    proof_bytes: &vector<u8>,
+    public_inputs_bytes: &vector<u8>,
+): bool
+```
+
+<ParamField path="vk" type="&VerificationKey" required>
+  Reference to the verification key object
+</ParamField>
+
+<ParamField path="proof_bytes" type="&vector<u8>" required>
+  Serialized Groth16 proof
+</ParamField>
+
+<ParamField path="public_inputs_bytes" type="&vector<u8>" required>
+  Serialized public inputs to the circuit
+</ParamField>
+
+<ResponseField name="valid" type="bool">
+  Returns `true` if proof is valid, `false` otherwise
+</ResponseField>
+
+**Errors:**
+
+- `EEmptyProof` (1): Proof bytes are empty
+- `EEmptyPublicInputs` (2): Public inputs are empty
+
+**Visibility:** `public(package)` — only callable by other modules in the `identipay` package.
+
+**Location:** `zk_verifier.move:56-69`
+
+### assert_proof_valid
+
+Verify a proof and abort if invalid. Convenience wrapper for use in settlement.
+
+**Function Signature:**
+
+```move
+public(package) fun assert_proof_valid(
+    vk: &VerificationKey,
+    proof_bytes: &vector<u8>,
+    public_inputs_bytes: &vector<u8>,
+)
+```
+
+**Errors:**
+
+- `EProofVerificationFailed` (0): Proof is invalid
+- Plus errors from `verify_proof`
+
+**Location:** `zk_verifier.move:73-80`
+
+## Accessors
+
+### circuit_name
+
+```move
+public fun circuit_name(vk: &VerificationKey): std::string::String
+```
+
+Returns the circuit name.
+
+**Location:** `zk_verifier.move:84`
+
+## ZK Circuits
+
+identiPay uses several ZK circuits for different purposes:
+
+### Age Check Circuit
+
+Verifies that a user's age meets a threshold without revealing their birthdate.
+
+**Private Inputs:**
+- `birthdate`: User's birthdate (YYYYMMDD as integer)
+- `credential_fields`: Other ID fields for commitment verification
+- `credential_signature`: Government signature on credential
+
+**Public Inputs:**
+- `min_age`: Minimum age requirement (e.g., 21)
+- `current_date`: Current date (YYYYMMDD)
+- `identity_commitment`: Poseidon hash of credential fields
+- `intent_hash`: Intent hash to bind proof to transaction
+
+**Circuit Logic:**
+```
+1. Verify credential signature using government public key
+2. Recompute identity_commitment = Poseidon(credential_fields)
+3. Compute age = (current_date - birthdate) / 10000
+4. Assert age >= min_age
+5. Output: [identity_commitment, intent_hash, min_age, 1]
+```
+
+### Identity Registration Circuit
+
+Proves ownership of a valid government credential for meta-address registration.
+
+**Private Inputs:**
+- `credential_fields`: ID fields (name, DOB, ID number, etc.)
+- `credential_signature`: Government signature
+
+**Public Inputs:**
+- `identity_commitment`: Poseidon(credential_fields)
+
+**Circuit Logic:**
+```
+1. Verify credential signature
+2. Recompute commitment = Poseidon(credential_fields)
+3. Output: [identity_commitment]
+```
+
+### Pool Spend Circuit
+
+Proves ownership of a note in the shielded pool without revealing which note.
+
+**Private Inputs:**
+- `amount`: Note amount
+- `owner_key`: Owner's private key
+- `salt`: Random salt from note creation
+- `merkle_path`: Merkle authentication path
+
+**Public Inputs:**
+- `merkle_root`: Current pool Merkle root
+- `nullifier`: Unique nullifier to prevent double-spend
+- `recipient`: Withdrawal recipient address
+- `withdraw_amount`: Amount being withdrawn
+- `change_commitment`: Commitment to change note (if partial withdrawal)
+
+**Circuit Logic:**
+```
+1. Compute commitment = Poseidon(amount, owner_key, salt)
+2. Verify merkle_path authenticates commitment to merkle_root
+3. Compute nullifier_check = Poseidon(commitment, owner_key)
+4. Assert nullifier_check == nullifier
+5. Assert withdraw_amount <= amount
+6. If withdraw_amount < amount:
+     change = amount - withdraw_amount
+     Assert change_commitment == Poseidon(change, owner_key, new_salt)
+7. Output: [merkle_root, nullifier, recipient, withdraw_amount, change_commitment]
+```
+
+## Usage Example
+
+<CodeGroup>
+
+```typescript Buyer: Generate Age Proof
+import { generateAgeProof } from '@identipay/zk';
+
+// User's government credential (from secure storage)
+const credential = {
+  firstName: 'Alice',
+  lastName: 'Smith',
+  birthdate: '19900315', // March 15, 1990
+  idNumber: '123456789',
+  signature: governmentSignature, // From credential issuer
+};
+
+// Compute identity commitment
+const identityCommitment = poseidon([
+  BigInt(credential.firstName),
+  BigInt(credential.lastName),
+  BigInt(credential.birthdate),
+  BigInt(credential.idNumber),
+]);
+
+// Generate proof for age >= 21 requirement
+const currentDate = '20260309'; // March 9, 2026
+const minAge = 21;
+
+const { proof, publicInputs } = await generateAgeProof({
+  credential,
+  identityCommitment,
+  currentDate,
+  minAge,
+  intentHash,
+});
+
+// Use in settlement
+await executeSettlement({
+  // ...
+  zk_vk: AGE_CHECK_VK_ID,
+  zk_proof: proof,
+  zk_public_inputs: publicInputs,
+});
+```
+
+```move Settlement Integration
+use identipay::zk_verifier;
+
+entry fun execute_commerce<T>(
+    // ...
+    zk_vk: &VerificationKey,
+    zk_proof: vector<u8>,
+    zk_public_inputs: vector<u8>,
+    // ...
+) {
+    // Verify ZK proof of buyer eligibility
+    zk_verifier::assert_proof_valid(
+        zk_vk,
+        &zk_proof,
+        &zk_public_inputs
+    );
+    
+    // Proof is valid, proceed with settlement...
+}
+```
+
+```typescript Off-Chain Verification (Testing)
+import { verifyGroth16Proof } from 'snarkjs';
+
+// Load verification key
+const vk = JSON.parse(
+  fs.readFileSync('./circuits/age_check/verification_key.json')
+);
+
+// Verify proof off-chain (should match on-chain result)
+const valid = await verifyGroth16Proof(
+  vk,
+  publicInputs,
+  proof
+);
+
+console.log('Proof valid:', valid);
+
+// Test on-chain
+const tx = new TransactionBlock();
+tx.moveCall({
+  target: `${PACKAGE_ID}::zk_verifier::test_verify_proof`,
+  arguments: [
+    tx.object(VK_ID),
+    tx.pure(proof),
+    tx.pure(publicInputs),
+  ],
+});
+
+const result = await client.devInspectTransactionBlock({
+  transactionBlock: tx,
+});
+
+console.log('On-chain verification:', result);
+```
+
+</CodeGroup>
+
+## Groth16 Background
+
+**Groth16** is a zero-knowledge SNARK proof system with:
+- **Small proofs**: 3 elliptic curve points (~192 bytes)
+- **Fast verification**: Single pairing check (~10ms)
+- **Trusted setup**: Requires one-time setup ceremony
+- **BN254 curve**: 128-bit security level
+
+### Proof Structure
+
+A Groth16 proof consists of 3 points on the BN254 elliptic curve:
+```
+π = (A, B, C)
+```
+
+Verification checks:
+```
+e(A, B) = e(α, β) · e(∑ pubInput_i · IC_i, γ) · e(C, δ)
+```
+
+Where `e()` is the optimal ate pairing on BN254.
+
+## Sui Native Integration
+
+Sui Move provides native Groth16 verification:
+
+```move
+use sui::groth16;
+
+// Create curve handle
+let curve = groth16::bn254();
+
+// Prepare verification key (one-time)
+let pvk = groth16::prepare_verifying_key(&curve, &raw_vk);
+
+// Parse proof and public inputs
+let proof_points = groth16::proof_points_from_bytes(proof_bytes);
+let public_inputs = groth16::public_proof_inputs_from_bytes(public_inputs_bytes);
+
+// Verify
+let valid = groth16::verify_groth16_proof(
+    &curve,
+    &pvk,
+    &public_inputs,
+    &proof_points
+);
+```
+
+This is implemented as a **Move native function** (C++ in the VM), making it very efficient.
+
+## Security Considerations
+
+<Warning>
+  **Trusted Setup**: Groth16 requires a trusted setup ceremony. If the setup's "toxic waste" is not destroyed, proofs can be forged. Use multi-party computation (MPC) ceremonies for production.
+</Warning>
+
+<Warning>
+  **Public Input Binding**: Always include `intent_hash` as a public input to prevent proof replay across different transactions.
+</Warning>
+
+<Note>
+  **Circuit Bugs**: Bugs in the circuit logic can allow invalid proofs to verify. Thoroughly audit circuits before deployment.
+</Note>
+
+<Info>
+  **Gas Costs**: Groth16 verification on Sui costs ~50,000 gas units per proof. This is efficient compared to other proof systems.
+</Info>
+
+## Privacy Guarantees
+
+<AccordionGroup>
+  <Accordion title="Zero Knowledge" icon="eye-slash">
+    Proofs reveal only the truth of the statement (e.g., "age >= 21"), not the underlying data (birthdate).
+  </Accordion>
+  
+  <Accordion title="Unlinkability" icon="unlink">
+    Different proofs from the same credential are unlinkable (assuming proper randomization in proof generation).
+  </Accordion>
+  
+  <Accordion title="Soundness" icon="shield">
+    Computationally infeasible to create a valid proof for a false statement (assuming trusted setup is secure).
+  </Accordion>
+  
+  <Accordion title="Succinctness" icon="compress">
+    Proofs are constant size (~192 bytes) regardless of computation complexity.
+  </Accordion>
+</AccordionGroup>
+
+## Circuit Development Workflow
+
+<Steps>
+  <Step title="Design Circuit">
+    Write circuit in Circom (or other ZK language) defining constraints.
+  </Step>
+  
+  <Step title="Trusted Setup">
+    Run Powers of Tau ceremony + circuit-specific setup to generate proving/verification keys.
+  </Step>
+  
+  <Step title="Deploy Verification Key">
+    Call `create_verification_key()` to deploy VK on-chain.
+  </Step>
+  
+  <Step title="Generate Proofs">
+    User wallets generate proofs off-chain using witness data + proving key.
+  </Step>
+  
+  <Step title="Verify On-Chain">
+    Settlement contract verifies proofs using `verify_proof()`.
+  </Step>
+</Steps>
+
+## Related Modules
+
+<CardGroup cols={2}>
+  <Card title="Settlement" icon="hand-holding-dollar" href="/protocol/settlement">
+    Uses ZK proofs for age-gated transactions
+  </Card>
+  <Card title="Meta-Address Registry" icon="address-book" href="/protocol/meta-address-registry">
+    Uses ZK proofs for identity registration
+  </Card>
+  <Card title="Shielded Pool" icon="shield-halved" href="/protocol/shielded-pool">
+    Uses ZK proofs for private withdrawals
+  </Card>
+</CardGroup>

@@ -1,0 +1,122 @@
+---
+title: 'API Introduction'
+description: 'Overview of the identiPay REST API'
+---
+
+## Overview
+
+The identiPay API provides a complete REST interface for implementing privacy-preserving payment systems using stealth addresses and zero-knowledge proofs on the Sui blockchain.
+
+## Base URL
+
+All API endpoints are relative to:
+
+```
+https://<hostname>/api/identipay/v1
+```
+
+For local development:
+
+```
+http://localhost:8000/api/identipay/v1
+```
+
+## API Versioning
+
+The API is versioned using URL path versioning. The current version is `v1`.
+
+All endpoints follow the pattern:
+```
+/api/identipay/v1/{resource}
+```
+
+## Architecture
+
+The identiPay API is built on:
+
+- **Framework**: Hono (TypeScript web framework)
+- **Runtime**: Deno
+- **Blockchain**: Sui Network
+- **Database**: PostgreSQL (via Drizzle ORM)
+
+## Key Features
+
+### Privacy-First Design
+
+- **Stealth Addresses**: Recipients remain anonymous using meta-address public keys
+- **No Address Exposure**: Name resolution returns only `spendPubkey` and `viewPubkey`, never Sui addresses
+- **View Tag Privacy**: Wallets can fetch all announcements locally to avoid revealing view tags to the backend
+
+### Gas Sponsorship
+
+The backend sponsors gas for all user transactions through a two-step flow:
+
+1. **Build**: Wallet requests sponsored transaction bytes via `/transactions/gas-sponsor`
+2. **Submit**: Wallet signs and submits via `/transactions/submit` where backend co-signs
+
+### Zero-Knowledge Proofs
+
+Supports ZK proofs for:
+- Age verification (age gates on purchases)
+- Shielded pool operations (privacy-enhanced deposits/withdrawals)
+- Identity commitments (name registration)
+
+### Real-Time Updates
+
+WebSocket connections available for:
+- Transaction status monitoring
+- Settlement confirmations
+
+## Response Format
+
+All responses use JSON with consistent formatting:
+
+### Success Response
+```json
+{
+  "field1": "value1",
+  "field2": "value2"
+}
+```
+
+### Error Response
+```json
+{
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "Human-readable error message",
+    "details": {}
+  }
+}
+```
+
+See the [Errors](/api/errors) page for detailed error codes and handling.
+
+## Rate Limiting
+
+Currently, no rate limiting is enforced. Future versions may implement per-merchant or per-IP rate limits.
+
+## CORS
+
+CORS is enabled for all origins to support web wallet integrations.
+
+## Health Check
+
+A health check endpoint is available at:
+
+```bash
+GET /health
+```
+
+Response:
+```json
+{
+  "status": "ok"
+}
+```
+
+## Next Steps
+
+- Review [Authentication](/api/authentication) to understand API key usage
+- Explore endpoint documentation for [Merchants](/api/merchants), [Proposals](/api/proposals), and [Transactions](/api/transactions)
+- Learn about [WebSocket](/api/websocket) real-time updates

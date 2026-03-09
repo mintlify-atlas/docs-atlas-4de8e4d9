@@ -1,0 +1,487 @@
+---
+title: "Receipt Contract"
+description: "Encrypted on-chain transaction receipts for buyers"
+---
+
+## Overview
+
+The Receipt contract (`identipay::receipt`) implements on-chain transaction receipts that are minted atomically during settlement and transferred to the buyer's stealth address.
+
+Receipts contain:
+- **Plaintext**: Merchant address, intent hash, timestamp
+- **Encrypted**: Item details, amounts, merchant name, order ID
+
+The encrypted payload is **AES-256-GCM ciphertext** that can be decrypted by:
+1. **Buyer**: Using their stealth private key
+2. **Merchant**: Using their private key + ephemeral public key (ECDH)
+
+This enables dispute resolution while preserving privacy from on-chain observers.
+
+## Source Code
+
+Location: `contracts/sources/receipt.move:6`
+
+## Data Structures
+
+### ReceiptObject
+
+On-chain receipt object minted during atomic settlement.
+
+<ParamField body="id" type="UID" required>
+  Sui object identifier (unique receipt ID)
+</ParamField>
+
+<ParamField body="merchant" type="address" required>
+  Merchant's Sui address (plaintext — needed for settlement routing)
+</ParamField>
+
+<ParamField body="intent_hash" type="vector<u8>" required>
+  SHA3-256 hash of the canonicalized intent (plaintext — needed for verification)
+</ParamField>
+
+<ParamField body="encrypted_payload" type="vector<u8>" required>
+  AES-256-GCM ciphertext of the receipt payload (items, amounts, merchant name)
+</ParamField>
+
+<ParamField body="payload_nonce" type="vector<u8>" required>
+  12-byte GCM nonce for decryption
+</ParamField>
+
+<ParamField body="ephemeral_pubkey" type="vector<u8>" required>
+  Ephemeral public key E = e*G (for merchant ECDH decryption)
+</ParamField>
+
+<ParamField body="timestamp" type="u64" required>
+  Settlement timestamp in epoch milliseconds
+</ParamField>
+
+```move
+public struct ReceiptObject has key, store {
+    id: UID,
+    merchant: address,
+    intent_hash: vector<u8>,
+    encrypted_payload: vector<u8>,
+    payload_nonce: vector<u8>,
+    ephemeral_pubkey: vector<u8>,
+    timestamp: u64,
+}
+```
+
+### ReceiptMinted
+
+Event emitted when a receipt is minted.
+
+<ResponseField name="receipt_id" type="ID">
+  Unique object ID of the receipt
+</ResponseField>
+
+<ResponseField name="merchant" type="address">
+  Merchant who issued the receipt
+</ResponseField>
+
+<ResponseField name="intent_hash" type="vector<u8>">
+  Intent hash this receipt corresponds to
+</ResponseField>
+
+<ResponseField name="timestamp" type="u64">
+  Minting timestamp (epoch ms)
+</ResponseField>
+
+```move
+public struct ReceiptMinted has copy, drop {
+    receipt_id: ID,
+    merchant: address,
+    intent_hash: vector<u8>,
+    timestamp: u64,
+}
+```
+
+## Public Functions
+
+### mint_receipt
+
+Mint a new receipt. Called by the settlement module during atomic execution.
+
+**Function Signature:**
+
+```move
+public(package) fun mint_receipt(
+    merchant: address,
+    intent_hash: vector<u8>,
+    encrypted_payload: vector<u8>,
+    payload_nonce: vector<u8>,
+    ephemeral_pubkey: vector<u8>,
+    ctx: &mut TxContext,
+): ReceiptObject
+```
+
+<ParamField path="merchant" type="address" required>
+  Merchant's Sui address
+</ParamField>
+
+<ParamField path="intent_hash" type="vector<u8>" required>
+  SHA3-256 hash of the intent
+</ParamField>
+
+<ParamField path="encrypted_payload" type="vector<u8>" required>
+  AES-256-GCM ciphertext of receipt data
+</ParamField>
+
+<ParamField path="payload_nonce" type="vector<u8>" required>
+  12-byte GCM nonce (must be exactly 12 bytes)
+</ParamField>
+
+<ParamField path="ephemeral_pubkey" type="vector<u8>" required>
+  Ephemeral X25519 public key (must be exactly 32 bytes)
+</ParamField>
+
+<ResponseField name="receipt" type="ReceiptObject">
+  The minted receipt object
+</ResponseField>
+
+**Errors:**
+
+- `EInvalidNonceLength` (0): Nonce is not 12 bytes
+- `EInvalidEphemeralPubkey` (1): Ephemeral pubkey is not 32 bytes
+- `EEmptyPayload` (2): Encrypted payload is empty
+- `EEmptyIntentHash` (3): Intent hash is empty
+
+**Visibility:** `public(package)` — only callable by the settlement module.
+
+**Location:** `receipt.move:52-83`
+
+## Accessors
+
+### merchant
+
+```move
+public fun merchant(receipt: &ReceiptObject): address
+```
+
+Returns the merchant's address.
+
+### intent_hash
+
+```move
+public fun intent_hash(receipt: &ReceiptObject): vector<u8>
+```
+
+Returns the intent hash.
+
+### id
+
+```move
+public fun id(receipt: &ReceiptObject): ID
+```
+
+Returns the receipt's object ID.
+
+### timestamp
+
+```move
+public fun timestamp(receipt: &ReceiptObject): u64
+```
+
+Returns the settlement timestamp.
+
+**Location:** `receipt.move:109-112`
+
+## Encryption Scheme
+
+Receipts use **AES-256-GCM** authenticated encryption with **ECDH** key derivation.
+
+### Key Derivation
+
+<Steps>
+  <Step title="Ephemeral Key Generation">
+    Buyer generates ephemeral X25519 keypair `(e, E = e*G)`
+  </Step>
+  
+  <Step title="ECDH Shared Secret">
+    Buyer computes `S = e * K_merchant` where `K_merchant` is from Trust Registry
+  </Step>
+  
+  <Step title="Key Derivation">
+    Derive AES key: `aes_key = HKDF-SHA256(S, salt="identipay-receipt", info="", length=32)`
+  </Step>
+  
+  <Step title="Encryption">
+    Encrypt payload: `ciphertext = AES-256-GCM(key=aes_key, nonce=random(12), plaintext=receipt_json, aad="")`
+  </Step>
+  
+  <Step title="Storage">
+    Store `(ciphertext, nonce, E)` on-chain
+  </Step>
+</Steps>
+
+### Decryption
+
+**Buyer:**
+1. Derive stealth private key `d` from stealth address
+2. Compute `S = d * G_merchant` (same shared secret)
+3. Derive `aes_key = HKDF-SHA256(S, ...)`
+4. Decrypt: `plaintext = AES-256-GCM-Decrypt(aes_key, nonce, ciphertext)`
+
+**Merchant:**
+1. Use stored merchant private key `k_merchant`
+2. Compute `S = k_merchant * E`
+3. Derive `aes_key = HKDF-SHA256(S, ...)`
+4. Decrypt: `plaintext = AES-256-GCM-Decrypt(aes_key, nonce, ciphertext)`
+
+## Receipt Payload Format
+
+The encrypted payload is a JSON object:
+
+```json
+{
+  "version": "1.0",
+  "merchant": {
+    "did": "did:identipay:shop.example.com:merchant123",
+    "name": "Example Coffee Shop",
+    "location": "123 Main St, San Francisco, CA"
+  },
+  "transaction": {
+    "orderId": "ORD-2026-03-09-00123",
+    "timestamp": "2026-03-09T10:30:00Z",
+    "total": "15.50",
+    "currency": "USDC",
+    "tax": "1.40",
+    "subtotal": "14.10"
+  },
+  "items": [
+    {
+      "name": "Cappuccino",
+      "quantity": 2,
+      "unitPrice": "5.00",
+      "total": "10.00",
+      "sku": "COFFEE-CAP-001"
+    },
+    {
+      "name": "Croissant",
+      "quantity": 1,
+      "unitPrice": "4.10",
+      "total": "4.10",
+      "sku": "PASTRY-CRS-001"
+    }
+  ],
+  "warranty": {
+    "included": true,
+    "warrantyId": "0x789...",
+    "duration": "90 days"
+  }
+}
+```
+
+## Usage Example
+
+<CodeGroup>
+
+```typescript Buyer Wallet: Encrypt Receipt
+import { deriveECDH, aesGcmEncrypt } from '@identipay/crypto';
+import { hkdf } from '@noble/hashes/hkdf';
+import { sha256 } from '@noble/hashes/sha256';
+
+// Prepare receipt data
+const receiptPayload = {
+  version: '1.0',
+  merchant: {
+    did: merchantEntry.did,
+    name: merchantEntry.name,
+    location: merchantEntry.location,
+  },
+  transaction: {
+    orderId: proposal.orderId,
+    timestamp: new Date().toISOString(),
+    total: proposal.amount,
+    currency: 'USDC',
+  },
+  items: proposal.items,
+};
+
+// Generate ephemeral keypair
+const ephemeralPrivateKey = randomBytes(32);
+const ephemeralPubkey = x25519.getPublicKey(ephemeralPrivateKey);
+
+// Derive shared secret with merchant
+const sharedSecret = deriveECDH(
+  ephemeralPrivateKey,
+  merchantEntry.publicKey
+);
+
+// Derive AES key
+const aesKey = hkdf(
+  sha256,
+  sharedSecret,
+  'identipay-receipt',
+  '',
+  32
+);
+
+// Encrypt payload
+const nonce = randomBytes(12);
+const { ciphertext, tag } = aesGcmEncrypt(
+  aesKey,
+  nonce,
+  JSON.stringify(receiptPayload)
+);
+
+const encryptedPayload = new Uint8Array([
+  ...ciphertext,
+  ...tag,
+]);
+
+// Use in settlement transaction
+await executeSettlement({
+  // ...
+  encrypted_payload: Array.from(encryptedPayload),
+  payload_nonce: Array.from(nonce),
+  ephemeral_pubkey: Array.from(ephemeralPubkey),
+});
+```
+
+```typescript Buyer Wallet: Decrypt Receipt
+import { aesGcmDecrypt } from '@identipay/crypto';
+
+// Fetch receipt from chain
+const receipt = await suiClient.getObject({
+  id: receiptId,
+  options: { showContent: true },
+});
+
+const {
+  encrypted_payload,
+  payload_nonce,
+  ephemeral_pubkey,
+  merchant,
+} = receipt.data.content.fields;
+
+// Derive stealth private key (from stealth address)
+const stealthPrivateKey = deriveStealthPrivateKey(
+  mySpendPrivateKey,
+  ephemeralPubkey
+);
+
+// Derive shared secret
+const sharedSecret = deriveECDH(
+  stealthPrivateKey,
+  merchantPublicKeyFromRegistry
+);
+
+// Derive AES key
+const aesKey = hkdf(
+  sha256,
+  sharedSecret,
+  'identipay-receipt',
+  '',
+  32
+);
+
+// Decrypt
+const ciphertext = encrypted_payload.slice(0, -16);
+const tag = encrypted_payload.slice(-16);
+
+const plaintext = aesGcmDecrypt(
+  aesKey,
+  payload_nonce,
+  ciphertext,
+  tag
+);
+
+const receiptData = JSON.parse(plaintext);
+console.log('Receipt:', receiptData);
+```
+
+```typescript Merchant: Decrypt Receipt
+// Merchant uses their private key to decrypt any receipt
+const { encrypted_payload, payload_nonce, ephemeral_pubkey } =
+  receipt.data.content.fields;
+
+// Derive shared secret using merchant's private key
+const sharedSecret = deriveECDH(
+  merchantPrivateKey,
+  ephemeral_pubkey
+);
+
+// Same key derivation as buyer
+const aesKey = hkdf(
+  sha256,
+  sharedSecret,
+  'identipay-receipt',
+  '',
+  32
+);
+
+// Decrypt
+const plaintext = aesGcmDecrypt(
+  aesKey,
+  payload_nonce,
+  encrypted_payload.slice(0, -16),
+  encrypted_payload.slice(-16)
+);
+
+const receiptData = JSON.parse(plaintext);
+```
+
+</CodeGroup>
+
+## Privacy Guarantees
+
+<AccordionGroup>
+  <Accordion title="On-Chain Privacy" icon="eye-slash">
+    On-chain observers see only ciphertext. Item details, amounts, and merchant name are hidden.
+  </Accordion>
+  
+  <Accordion title="Buyer Privacy" icon="user-secret">
+    Receipt is transferred to a one-time stealth address. On-chain observers cannot link it to the buyer's identity.
+  </Accordion>
+  
+  <Accordion title="Merchant Visibility" icon="store">
+    Merchants can decrypt all receipts they issued (for accounting, dispute resolution). This is by design.
+  </Accordion>
+  
+  <Accordion title="Third-Party Exclusion" icon="ban">
+    Only the buyer and merchant can decrypt the receipt. No third party (including contract deployer) has access.
+  </Accordion>
+</AccordionGroup>
+
+## Security Considerations
+
+<Warning>
+  **Nonce Uniqueness**: Never reuse a nonce with the same AES key. Always generate fresh random nonces for each receipt.
+</Warning>
+
+<Note>
+  **Authenticated Encryption**: AES-GCM provides both confidentiality and authenticity. The authentication tag prevents tampering with the ciphertext.
+</Note>
+
+<Info>
+  **Key Derivation**: HKDF-SHA256 derives the AES key from the ECDH shared secret. This ensures different receipts use different keys even with the same shared secret (via different ephemeral keys).
+</Info>
+
+<Warning>
+  **Ephemeral Key Freshness**: Always generate a fresh ephemeral keypair for each receipt. Reusing ephemeral keys breaks forward secrecy.
+</Warning>
+
+## Dispute Resolution
+
+Receipts enable dispute resolution while preserving privacy:
+
+1. **Buyer files dispute**: Buyer claims they didn't receive items
+2. **Merchant decrypts receipt**: Merchant uses their private key to decrypt the receipt on-chain
+3. **Proof of transaction**: Merchant provides decrypted receipt showing items, amounts, order ID
+4. **On-chain verification**: Anyone can verify the ciphertext matches on-chain data
+5. **Resolution**: Dispute resolver (DAO, escrow) makes decision based on evidence
+
+## Related Modules
+
+<CardGroup cols={2}>
+  <Card title="Settlement" icon="hand-holding-dollar" href="/protocol/settlement">
+    Mints receipts during atomic settlement
+  </Card>
+  <Card title="Warranty" icon="shield-check" href="/protocol/warranty">
+    Optional warranty linked to receipt
+  </Card>
+  <Card title="Trust Registry" icon="certificate" href="/protocol/trust-registry">
+    Provides merchant public key for encryption
+  </Card>
+</CardGroup>

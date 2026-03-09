@@ -1,0 +1,531 @@
+---
+title: 'Database Schema'
+description: 'PostgreSQL database schema for the identiPay backend'
+icon: 'database'
+---
+
+## Overview
+
+The identiPay backend uses PostgreSQL with Drizzle ORM for type-safe database operations. The schema is designed to maintain user privacy while enabling efficient payment processing.
+
+## Schema Definition
+
+The database schema is defined in `src/db/schema.ts` using Drizzle ORM:
+
+```typescript src/db/schema.ts
+import {
+  pgTable,
+  uuid,
+  varchar,
+  char,
+  boolean,
+  timestamp,
+  jsonb,
+  text,
+  integer,
+  pgEnum,
+  index,
+} from "drizzle-orm/pg-core";
+```
+
+## Tables
+
+### Merchants
+
+Stores registered merchant accounts:
+
+```typescript
+export const merchants = pgTable("merchants", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: varchar("name", { length: 255 }).notNull(),
+  suiAddress: varchar("sui_address", { length: 66 }).notNull(),
+  hostname: varchar("hostname", { length: 255 }).unique().notNull(),
+  did: varchar("did", { length: 512 }).unique().notNull(),
+  publicKey: char("public_key", { length: 64 }).notNull(),
+  apiKeyHash: char("api_key_hash", { length: 64 }).notNull(),
+  active: boolean("active").default(true).notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+```
+
+<ResponseField name="id" type="uuid">
+  Unique merchant identifier (auto-generated)
+</ResponseField>
+
+<ResponseField name="name" type="varchar(255)">
+  Merchant display name
+</ResponseField>
+
+<ResponseField name="suiAddress" type="varchar(66)">
+  Merchant's Sui blockchain address for receiving payments
+</ResponseField>
+
+<ResponseField name="hostname" type="varchar(255)" unique>
+  Merchant's domain name (unique constraint)
+</ResponseField>
+
+<ResponseField name="did" type="varchar(512)" unique>
+  Decentralized identifier for the merchant
+</ResponseField>
+
+<ResponseField name="publicKey" type="char(64)">
+  Merchant's public key (hex-encoded)
+</ResponseField>
+
+<ResponseField name="apiKeyHash" type="char(64)">
+  Hashed API key for authentication
+</ResponseField>
+
+<ResponseField name="active" type="boolean" default="true">
+  Whether the merchant account is active
+</ResponseField>
+
+### Proposals
+
+Stores payment proposals created by merchants:
+
+```typescript
+export const proposalStatusEnum = pgEnum("proposal_status", [
+  "pending",
+  "settled",
+  "expired",
+  "cancelled",
+]);
+
+export const proposals = pgTable(
+  "proposals",
+  {
+    transactionId: uuid("transaction_id").primaryKey().defaultRandom(),
+    merchantId: uuid("merchant_id")
+      .references(() => merchants.id)
+      .notNull(),
+    proposalJson: jsonb("proposal_json").notNull(),
+    intentHash: char("intent_hash", { length: 64 }).unique().notNull(),
+    status: proposalStatusEnum("status").default("pending").notNull(),
+    expiresAt: timestamp("expires_at").notNull(),
+    suiTxDigest: varchar("sui_tx_digest", { length: 66 }),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (table) => [
+    index("proposals_intent_hash_idx").on(table.intentHash),
+    index("proposals_status_idx").on(table.status),
+    index("proposals_merchant_id_idx").on(table.merchantId),
+  ],
+);
+```
+
+<ResponseField name="transactionId" type="uuid">
+  Unique transaction identifier (auto-generated)
+</ResponseField>
+
+<ResponseField name="merchantId" type="uuid">
+  Foreign key reference to `merchants.id`
+</ResponseField>
+
+<ResponseField name="proposalJson" type="jsonb">
+  Full proposal details (items, amount, constraints)
+</ResponseField>
+
+<ResponseField name="intentHash" type="char(64)" unique>
+  Hash of the payment intent (unique constraint)
+</ResponseField>
+
+<ResponseField name="status" type="enum">
+  Proposal status: `pending`, `settled`, `expired`, or `cancelled`
+</ResponseField>
+
+<ResponseField name="expiresAt" type="timestamp">
+  Expiration timestamp for the proposal
+</ResponseField>
+
+<ResponseField name="suiTxDigest" type="varchar(66)">
+  Sui transaction digest (set after settlement)
+</ResponseField>
+
+**Indexes**:
+- `intent_hash` (for quick lookup by intent)
+- `status` (for filtering active proposals)
+- `merchant_id` (for merchant transaction history)
+
+### Names
+
+Caches registered user names and their public keys:
+
+```typescript
+export const names = pgTable("names", {
+  name: varchar("name", { length: 20 }).primaryKey(),
+  spendPubkey: char("spend_pubkey", { length: 64 }).notNull(),
+  viewPubkey: char("view_pubkey", { length: 64 }).notNull(),
+  identityCommitment: char("identity_commitment", { length: 64 }).notNull(),
+  onChainObjectId: varchar("on_chain_object_id", { length: 66 }),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+```
+
+<ResponseField name="name" type="varchar(20)">
+  Unique username (3-20 characters)
+</ResponseField>
+
+<ResponseField name="spendPubkey" type="char(64)">
+  User's spend public key (hex-encoded)
+</ResponseField>
+
+<ResponseField name="viewPubkey" type="char(64)">
+  User's view public key for stealth addresses (hex-encoded)
+</ResponseField>
+
+<ResponseField name="identityCommitment" type="char(64)">
+  Hash commitment to identity attributes
+</ResponseField>
+
+<ResponseField name="onChainObjectId" type="varchar(66)">
+  Sui object ID for the on-chain name registration
+</ResponseField>
+
+<Note>
+This is a cache-only table. No buyer address is stored. No foreign key to announcements table to preserve privacy.
+</Note>
+
+### Announcements
+
+Stores stealth address announcements for payment notifications:
+
+```typescript
+export const announcements = pgTable(
+  "announcements",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    ephemeralPubkey: char("ephemeral_pubkey", { length: 64 }).notNull(),
+    viewTag: integer("view_tag").notNull(),
+    stealthAddress: varchar("stealth_address", { length: 66 }).notNull(),
+    metadata: text("metadata"),
+    txDigest: varchar("tx_digest", { length: 66 }).notNull(),
+    timestamp: timestamp("timestamp").defaultNow().notNull(),
+  },
+  (table) => [
+    index("announcements_view_tag_idx").on(table.viewTag),
+    index("announcements_timestamp_idx").on(table.timestamp),
+    index("announcements_stealth_address_idx").on(table.stealthAddress),
+  ],
+);
+```
+
+<ResponseField name="id" type="uuid">
+  Unique announcement identifier (auto-generated)
+</ResponseField>
+
+<ResponseField name="ephemeralPubkey" type="char(64)">
+  Ephemeral public key for shared secret derivation
+</ResponseField>
+
+<ResponseField name="viewTag" type="integer">
+  View tag for efficient announcement scanning (optimization)
+</ResponseField>
+
+<ResponseField name="stealthAddress" type="varchar(66)">
+  Generated stealth address for the payment
+</ResponseField>
+
+<ResponseField name="metadata" type="text">
+  Optional encrypted metadata (memo, receipt data)
+</ResponseField>
+
+<ResponseField name="txDigest" type="varchar(66)">
+  Sui transaction digest that created this announcement
+</ResponseField>
+
+**Indexes**:
+- `view_tag` (for efficient scanning by tag)
+- `timestamp` (for chronological queries)
+- `stealth_address` (for balance queries)
+
+<Warning>
+Privacy Invariant: This table has NO foreign key to the `names` table. Announcements never link to identities.
+</Warning>
+
+### Event Cursors
+
+Tracks event polling position for reliable indexing:
+
+```typescript
+export const eventCursors = pgTable("event_cursors", {
+  eventType: varchar("event_type", { length: 128 }).primaryKey(),
+  txDigest: varchar("tx_digest", { length: 66 }).notNull(),
+  eventSeq: varchar("event_seq", { length: 20 }).notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+```
+
+<ResponseField name="eventType" type="varchar(128)">
+  Event type identifier (e.g., `settlement::SettlementEvent`)
+</ResponseField>
+
+<ResponseField name="txDigest" type="varchar(66)">
+  Last processed transaction digest
+</ResponseField>
+
+<ResponseField name="eventSeq" type="varchar(20)">
+  Last processed event sequence number
+</ResponseField>
+
+<Note>
+Used for cursor-based event polling, replacing unreliable WebSocket subscriptions.
+</Note>
+
+### Pay Requests
+
+Stores peer-to-peer payment requests:
+
+```typescript
+export const payRequestStatusEnum = pgEnum("pay_request_status", [
+  "pending",
+  "paid",
+  "expired",
+  "cancelled",
+]);
+
+export const payRequests = pgTable("pay_requests", {
+  requestId: uuid("request_id").primaryKey().defaultRandom(),
+  recipientName: varchar("recipient_name", { length: 20 }).notNull(),
+  amount: varchar("amount", { length: 78 }).notNull(),
+  currency: varchar("currency", { length: 10 }).notNull(),
+  memo: text("memo"),
+  expiresAt: timestamp("expires_at").notNull(),
+  status: payRequestStatusEnum("status").default("pending").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+```
+
+<ResponseField name="requestId" type="uuid">
+  Unique payment request identifier (auto-generated)
+</ResponseField>
+
+<ResponseField name="recipientName" type="varchar(20)">
+  Username of the payment recipient
+</ResponseField>
+
+<ResponseField name="amount" type="varchar(78)">
+  Payment amount (stored as string to preserve precision)
+</ResponseField>
+
+<ResponseField name="currency" type="varchar(10)">
+  Currency code (e.g., "USDC")
+</ResponseField>
+
+<ResponseField name="memo" type="text">
+  Optional payment memo/note
+</ResponseField>
+
+<ResponseField name="status" type="enum">
+  Request status: `pending`, `paid`, `expired`, or `cancelled`
+</ResponseField>
+
+## Enums
+
+### Proposal Status
+
+```typescript
+export const proposalStatusEnum = pgEnum("proposal_status", [
+  "pending",   // Waiting for payment
+  "settled",   // Payment completed on-chain
+  "expired",   // Proposal expired before payment
+  "cancelled", // Manually cancelled by merchant
+]);
+```
+
+### Pay Request Status
+
+```typescript
+export const payRequestStatusEnum = pgEnum("pay_request_status", [
+  "pending",   // Waiting for payment
+  "paid",      // Payment received
+  "expired",   // Request expired
+  "cancelled", // Cancelled by requester
+]);
+```
+
+## Migrations
+
+### Generate Migration
+
+When you modify the schema, generate a migration:
+
+```bash
+deno task db:generate
+```
+
+This creates a SQL migration file in `./drizzle/` directory.
+
+### Apply Migration
+
+Apply pending migrations to the database:
+
+```bash
+deno task db:migrate
+```
+
+### Manual Migration
+
+You can also apply migrations manually:
+
+```sql
+-- Example: Add index to proposals table
+CREATE INDEX proposals_created_at_idx ON proposals(created_at);
+```
+
+## Database Queries
+
+### Using Drizzle ORM
+
+<CodeGroup>
+
+```typescript Find Proposal by Intent Hash
+import { eq } from "drizzle-orm";
+
+const [proposal] = await db
+  .select()
+  .from(proposals)
+  .where(eq(proposals.intentHash, intentHash))
+  .limit(1);
+```
+
+```typescript Update Proposal Status
+import { eq } from "drizzle-orm";
+
+await db
+  .update(proposals)
+  .set({ status: "settled", suiTxDigest: txDigest })
+  .where(eq(proposals.transactionId, txId));
+```
+
+```typescript Expire Old Proposals
+import { eq, lt, and } from "drizzle-orm";
+
+await db
+  .update(proposals)
+  .set({ status: "expired" })
+  .where(
+    and(
+      eq(proposals.status, "pending"),
+      lt(proposals.expiresAt, new Date()),
+    ),
+  );
+```
+
+```typescript Query Announcements by View Tag
+import { eq, gte } from "drizzle-orm";
+
+const announcements = await db
+  .select()
+  .from(announcements)
+  .where(
+    and(
+      eq(announcements.viewTag, viewTag),
+      gte(announcements.timestamp, lastScanTime),
+    ),
+  )
+  .orderBy(announcements.timestamp);
+```
+
+</CodeGroup>
+
+## Privacy Considerations
+
+### Data Minimization
+
+- **No user addresses stored**: Only stealth addresses (one-time use)
+- **No identity linkage**: Announcements table has no foreign keys to identities
+- **Cached public keys**: Names table caches public data only
+
+### Separation of Concerns
+
+```
+Merchants Table
+└─ Proposals Table (FK: merchantId)
+
+Names Table (isolated cache)
+
+Announcements Table (isolated, no FKs)
+```
+
+This schema design ensures that:
+1. Merchant transactions cannot be linked to specific users
+2. User identities cannot be derived from announcements
+3. Payment privacy is preserved at the database level
+
+## Backup and Maintenance
+
+### Backup Database
+
+```bash
+pg_dump -U identipay_user identipay > identipay_backup.sql
+```
+
+### Restore Database
+
+```bash
+psql -U identipay_user identipay < identipay_backup.sql
+```
+
+### Vacuum and Analyze
+
+```sql
+VACUUM ANALYZE proposals;
+VACUUM ANALYZE announcements;
+```
+
+## Performance Tips
+
+### Index Usage
+
+- Use indexed columns in `WHERE` clauses:
+  ```typescript
+  // Good: Uses index
+  .where(eq(proposals.intentHash, hash))
+  
+  // Bad: No index on proposalJson
+  .where(sql`proposal_json->>'amount' = '100'`)
+  ```
+
+### Query Optimization
+
+- Limit result sets:
+  ```typescript
+  .limit(100) // Prevent large result sets
+  ```
+
+- Use select specific columns:
+  ```typescript
+  .select({ id: proposals.transactionId, status: proposals.status })
+  ```
+
+### Connection Pooling
+
+The backend uses `postgres` library with connection pooling:
+
+```typescript
+import postgres from "postgres";
+
+export function createDb(databaseUrl: string) {
+  const client = postgres(databaseUrl, {
+    max: 10, // Maximum pool size
+    idle_timeout: 20,
+  });
+  
+  const db = drizzle(client);
+  return { db, client };
+}
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Sui Configuration" icon="link" href="/integration/sui-configuration">
+    Deploy and configure Sui blockchain contracts
+  </Card>
+  <Card title="API Reference" icon="code" href="/api-reference/introduction">
+    Explore the REST API endpoints
+  </Card>
+</CardGroup>

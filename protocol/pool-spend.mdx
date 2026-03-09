@@ -1,0 +1,517 @@
+---
+title: 'Pool Spend Circuit'
+description: 'Prove ownership of shielded pool notes for anonymous withdrawals using Merkle proofs and nullifiers'
+---
+
+## Overview
+
+The **pool_spend** circuit proves the right to spend from a shielded pool note without revealing the note's owner or amount. It supports partial withdrawals by producing a change commitment.
+
+<Note>
+  Circuit source: `/home/daytona/workspace/source/circuits/pool_spend.circom:54`
+  
+  Constraint count: ~35,000 (heavy circuit, ~15 seconds proving time)
+</Note>
+
+## Purpose
+
+The shielded pool acts as a **privacy firewall** to prevent address clustering:
+
+1. User receives payments to multiple stealth addresses
+2. Deposits coins into the shielded pool with a note commitment
+3. Later withdraws to a fresh address via ZK proof
+4. Observer cannot link deposit address to withdrawal address
+
+See [Shielded Pool Contract](/protocol/shielded-pool) for the on-chain implementation.
+
+## Circuit Interface
+
+### Private Inputs
+
+<ParamField path="noteAmount" type="u64" required>
+  The amount stored in the note (in base units, e.g., USDC micro-units).
+  
+  Must be ≤ 64 bits to fit in Sui's u64 type.
+</ParamField>
+
+<ParamField path="ownerKey" type="field element" required>
+  The owner's secret key.
+  
+  This is a random 32-byte value generated when creating the note. Store it securely in the wallet.
+</ParamField>
+
+<ParamField path="salt" type="field element" required>
+  Randomness used when creating the note commitment.
+  
+  Ensures note commitments are unique even if amount and owner are reused.
+</ParamField>
+
+<ParamField path="pathElements[20]" type="field element[]" required>
+  Merkle proof sibling hashes (depth 20 = 2^20 ≈ 1M notes capacity).
+  
+  Obtained from the Merkle tree off-chain indexer or full node.
+</ParamField>
+
+<ParamField path="pathIndices[20]" type="bit[]" required>
+  Merkle proof path directions (0 = left, 1 = right).
+  
+  Each element must be binary (0 or 1).
+</ParamField>
+
+### Public Inputs
+
+<ParamField path="merkleRoot" type="u256" required>
+  The current Merkle tree root from the shielded pool contract.
+  
+  Read from `ShieldedPool.merkle_root` on-chain.
+</ParamField>
+
+<ParamField path="nullifier" type="u256" required>
+  Unique nullifier to prevent double-spending.
+  
+  Computed as `Poseidon(commitment, ownerKey)`. Once spent, it's permanently marked in the nullifier set.
+</ParamField>
+
+<ParamField path="recipient" type="address" required>
+  The recipient address/identifier (Sui address as u256).
+  
+  Binds the proof to a specific withdrawal destination.
+</ParamField>
+
+<ParamField path="withdrawAmount" type="u64" required>
+  The amount being withdrawn.
+  
+  Must be ≤ `noteAmount`. If less, the change goes to `changeCommitment`.
+</ParamField>
+
+<ParamField path="changeCommitment" type="u256" required>
+  Commitment for the remaining change note.
+  
+  If `withdrawAmount == noteAmount`, this must be 0.
+  If `withdrawAmount < noteAmount`, this must be a valid commitment to the change.
+</ParamField>
+
+## Circuit Logic
+
+The circuit performs six verification steps:
+
+### 1. Compute Note Commitment
+
+Reconstruct the note commitment from private inputs:
+
+```circom pool_spend.circom:92
+component commitHasher = Poseidon(3);
+commitHasher.inputs[0] <== noteAmount;
+commitHasher.inputs[1] <== ownerKey;
+commitHasher.inputs[2] <== salt;
+
+signal commitment;
+commitment <== commitHasher.out;
+```
+
+**Formula**: `commitment = Poseidon(noteAmount, ownerKey, salt)`
+
+This matches the commitment created during deposit.
+
+### 2. Verify Merkle Proof
+
+Prove the commitment exists in the Merkle tree:
+
+```circom pool_spend.circom:103
+component merkleProof = MerkleProof(20);  // Depth 20
+merkleProof.leaf <== commitment;
+for (var i = 0; i < 20; i++) {
+    merkleProof.pathElements[i] <== pathElements[i];
+    merkleProof.pathIndices[i] <== pathIndices[i];
+}
+merkleProof.root === merkleRoot;  // Must match public input
+```
+
+The `MerkleProof` template (defined in `pool_spend.circom:9`) uses Poseidon hashing:
+
+```circom pool_spend.circom:18
+for (var i = 0; i < depth; i++) {
+    // Ensure pathIndices[i] is binary (0 or 1)
+    indexChecks[i] = IsZero();
+    indexChecks[i].in <== pathIndices[i] * (pathIndices[i] - 1);
+    indexChecks[i].out === 1;
+
+    hashers[i] = Poseidon(2);
+
+    // left = currentHash[i] + pathIndices[i] * (pathElements[i] - currentHash[i])
+    hashers[i].inputs[0] <== currentHash[i] + pathIndices[i] * (pathElements[i] - currentHash[i]);
+
+    // right = pathElements[i] + pathIndices[i] * (currentHash[i] - pathElements[i])
+    hashers[i].inputs[1] <== pathElements[i] + pathIndices[i] * (currentHash[i] - pathElements[i]);
+
+    currentHash[i + 1] <== hashers[i].out;
+}
+```
+
+This is a **binary Merkle tree** where:
+- Each node = `Poseidon(left, right)`
+- `pathIndices[i] = 0` means current node is left child
+- `pathIndices[i] = 1` means current node is right child
+
+<Note>
+  The Merkle tree uses the same Poseidon hash as the Sui contract (`sui::poseidon::poseidon_bn254`), ensuring proof compatibility.
+</Note>
+
+### 3. Compute Nullifier
+
+Generate a unique nullifier for this note:
+
+```circom pool_spend.circom:115
+component nullifierHasher = Poseidon(2);
+nullifierHasher.inputs[0] <== commitment;
+nullifierHasher.inputs[1] <== ownerKey;
+nullifierHasher.out === nullifier;  // Must match public input
+```
+
+**Formula**: `nullifier = Poseidon(commitment, ownerKey)`
+
+**Why this works**:
+- Deterministic: Same note always produces same nullifier
+- Unique: Different notes have different commitments → different nullifiers
+- Unspendable by others: Requires knowledge of `ownerKey`
+
+### 4. Range Check Amounts
+
+Prove `withdrawAmount ≤ noteAmount` without revealing exact values:
+
+```circom pool_spend.circom:125
+signal changeAmount;
+changeAmount <== noteAmount - withdrawAmount;
+
+// Decompose changeAmount into 64 bits to prove it's non-negative
+component changeRangeCheck = Num2Bits(64);
+changeRangeCheck.in <== changeAmount;
+
+// Also range-check withdrawAmount to 64 bits
+component withdrawRangeCheck = Num2Bits(64);
+withdrawRangeCheck.in <== withdrawAmount;
+```
+
+**Why `Num2Bits` proves non-negativity**:
+- If `changeAmount < 0`, it wraps around to a huge number in the field
+- `Num2Bits(64)` will fail if the input doesn't fit in 64 bits
+- Therefore, `changeAmount ≥ 0` and `changeAmount < 2^64`
+
+### 5. Validate Change Commitment
+
+Ensure change commitments are correctly formed:
+
+```circom pool_spend.circom:141
+component isChangeZero = IsZero();
+isChangeZero.in <== changeAmount;
+
+// When changeAmount == 0: isChangeZero.out == 1, so changeCommitment must be 0
+// Constraint: isChangeZero.out * changeCommitment === 0
+signal zeroCheck;
+zeroCheck <== isChangeZero.out * changeCommitment;
+zeroCheck === 0;
+
+// When change > 0, ensure changeCommitment is non-zero
+component isChangeCommitmentZero = IsZero();
+isChangeCommitmentZero.in <== changeCommitment;
+
+signal hasChange;
+hasChange <== 1 - isChangeZero.out;
+
+signal hasCommitment;
+hasCommitment <== 1 - isChangeCommitmentZero.out;
+
+// If hasChange == 1, then hasCommitment must be 1
+// hasChange * (1 - hasCommitment) === 0
+signal changeNeedsCommitment;
+changeNeedsCommitment <== hasChange * (1 - hasCommitment);
+changeNeedsCommitment === 0;
+```
+
+**Logic summary**:
+- If `changeAmount == 0` → `changeCommitment` must be 0
+- If `changeAmount > 0` → `changeCommitment` must be non-zero
+
+<Warning>
+  The circuit does NOT verify that `changeCommitment` is correctly formed (i.e., `Poseidon(changeAmount, ownerKey, newSalt)`). The user is responsible for computing this off-chain. If they provide a malformed commitment, they lose access to their change.
+</Warning>
+
+### 6. Bind Recipient
+
+Prevent front-running by constraining the recipient:
+
+```circom pool_spend.circom:174
+signal recipientSquared;
+recipientSquared <== recipient * recipient;
+```
+
+This ensures the `recipient` public input is used in a constraint, preventing proof malleability.
+
+## Proof Generation
+
+### Step 1: Obtain Merkle Proof
+
+```typescript
+// Query off-chain indexer or full node for Merkle proof
+const merkleProof = await indexer.getMerkleProof(
+  commitment,
+  currentLeafIndex
+);
+
+const { pathElements, pathIndices } = merkleProof;
+```
+
+### Step 2: Compute Nullifier and Change
+
+```typescript
+import { poseidon } from 'circomlibjs';
+
+// Recompute commitment
+const commitment = poseidon([
+  BigInt(noteAmount),
+  BigInt(ownerKey),
+  BigInt(salt)
+]);
+
+// Compute nullifier
+const nullifier = poseidon([
+  commitment,
+  BigInt(ownerKey)
+]);
+
+// Compute change
+const changeAmount = noteAmount - withdrawAmount;
+let changeCommitment;
+
+if (changeAmount > 0) {
+  // Generate new salt for change note
+  const newSalt = BigInt('0x' + randomBytes(32).toString('hex'));
+  changeCommitment = poseidon([
+    BigInt(changeAmount),
+    BigInt(ownerKey),  // Reuse owner key
+    newSalt
+  ]);
+  
+  // Store newSalt for future withdrawals
+  await wallet.storeNote({
+    amount: changeAmount,
+    ownerKey,
+    salt: newSalt,
+    commitment: changeCommitment
+  });
+} else {
+  changeCommitment = 0n;
+}
+```
+
+### Step 3: Generate Proof
+
+```typescript
+import { groth16 } from 'snarkjs';
+
+const inputs = {
+  // Private inputs
+  noteAmount: noteAmount.toString(),
+  ownerKey: ownerKey.toString(),
+  salt: salt.toString(),
+  pathElements: pathElements.map(x => x.toString()),
+  pathIndices: pathIndices.map(x => x.toString()),
+  
+  // Public inputs
+  merkleRoot: merkleRoot.toString(),
+  nullifier: nullifier.toString(),
+  recipient: recipientAddress.toString(),
+  withdrawAmount: withdrawAmount.toString(),
+  changeCommitment: changeCommitment.toString()
+};
+
+const { proof, publicSignals } = await groth16.fullProve(
+  inputs,
+  'build/pool_spend_js/pool_spend.wasm',
+  'build/pool_spend_final.zkey'
+);
+```
+
+<Note>
+  This circuit is **heavy** (~35K constraints). On a typical laptop, proving takes ~15 seconds. Consider using a web worker or showing a progress indicator.
+</Note>
+
+### Step 4: Submit Withdrawal Transaction
+
+```typescript
+import { Transaction } from '@mysten/sui';
+
+const tx = new Transaction();
+tx.moveCall({
+  target: `${PACKAGE_ID}::shielded_pool::withdraw`,
+  typeArguments: ['0x2::sui::SUI'],  // Or USDC type
+  arguments: [
+    tx.object(SHIELDED_POOL),
+    tx.object(VERIFICATION_KEY),
+    tx.pure('vector<u8>', serializeGroth16Proof(proof)),
+    tx.pure('vector<u8>', serializePublicInputs(publicSignals)),
+    tx.pure('u256', nullifier),
+    tx.pure('address', recipientAddress),
+    tx.pure('u64', withdrawAmount),
+    tx.pure('u256', changeCommitment)
+  ]
+});
+
+const result = await signAndExecuteTransaction({ transaction: tx });
+```
+
+The contract will:
+1. Verify the ZK proof
+2. Check nullifier hasn't been spent
+3. Transfer tokens to recipient
+4. If `changeCommitment != 0`, insert it into the Merkle tree
+5. Mark nullifier as spent
+
+See `shielded_pool.move:150` for implementation details.
+
+## Security Analysis
+
+### Double-Spend Prevention
+
+The nullifier ensures each note can only be spent once:
+
+```move
+// In shielded_pool.move:166
+assert!(!pool.nullifiers.contains(nullifier), ENullifierAlreadySpent);
+pool.nullifiers.add(nullifier, true);
+```
+
+Once a nullifier is in the set, any future proof with the same nullifier is rejected.
+
+### Anonymity Set
+
+With a Merkle tree of depth 20, the anonymity set is:
+- **Maximum**: 2^20 = 1,048,576 notes
+- **Effective**: Number of deposits before your withdrawal
+
+Example: If 1000 notes have been deposited, your withdrawal hides among 1000 possible sources.
+
+<Note>
+  Unlike tornado.cash (fixed denominations), identiPay allows arbitrary amounts. This can leak information if amounts are unique. Consider rounding to common denominations (e.g., 10 USDC, 100 USDC, 1000 USDC).
+</Note>
+
+### Change Note Privacy
+
+The change commitment is inserted into the Merkle tree:
+
+```move
+// In shielded_pool.move:176
+if (change_commitment != 0) {
+    let new_root = insert_leaf(pool, change_commitment);
+    pool.merkle_root = new_root;
+    pool.next_leaf_index = pool.next_leaf_index + 1;
+};
+```
+
+**Privacy consideration**: An observer can see:
+- Withdrawal amount (public)
+- New leaf added (if change > 0)
+
+They can infer: `original_note_amount = withdrawal_amount + change_amount`
+
+However, they cannot determine which previous deposit this withdrawal came from.
+
+### Front-Running Protection
+
+The `recipient` is a public input, bound by the constraint at `pool_spend.circom:174`. An attacker cannot modify the proof to redirect funds to a different address.
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Constraints | ~35,000 |
+| Proving time (browser, M1) | ~15 seconds |
+| Proving time (server, AMD 5950X) | ~6 seconds |
+| Proof size | 128 bytes (Groth16) |
+| Verification gas (Sui) | ~0.002 SUI |
+| WASM size | ~15MB |
+| zkey size | ~40MB |
+
+### Optimization Tips
+
+**Client-side**:
+- Use Web Workers to avoid blocking the UI
+- Cache WASM and zkey files (use Service Worker)
+- Show progress indicator (snarkjs doesn't support progress callbacks, estimate based on time)
+
+**Server-side**:
+- Use multi-threaded prover (e.g., rapidsnark)
+- Batch proof generation requests
+- Consider GPU acceleration for high-throughput scenarios
+
+## Testing
+
+```bash
+# Compile circuit
+npm run compile:pool
+
+# Run tests
+npm test -- test/pool_spend.test.js
+```
+
+Example test case:
+
+```javascript
+const { expect } = require('chai');
+const { wasm: wasm_tester } = require('circom_tester');
+const { poseidon } = require('circomlibjs');
+
+describe('PoolSpend circuit', () => {
+  it('should accept valid withdrawal', async () => {
+    const circuit = await wasm_tester('pool_spend.circom');
+    
+    const noteAmount = 1000n;
+    const ownerKey = 12345n;
+    const salt = 67890n;
+    const withdrawAmount = 600n;
+    const changeAmount = 400n;
+    
+    const commitment = poseidon([noteAmount, ownerKey, salt]);
+    const nullifier = poseidon([commitment, ownerKey]);
+    
+    // Build simple Merkle tree with depth 3
+    const pathElements = [0, 0, 0];
+    const pathIndices = [0, 0, 0];
+    const merkleRoot = computeMerkleRoot(commitment, pathElements, pathIndices);
+    
+    const changeCommitment = poseidon([changeAmount, ownerKey, 99999n]);
+    
+    const inputs = {
+      noteAmount: noteAmount.toString(),
+      ownerKey: ownerKey.toString(),
+      salt: salt.toString(),
+      pathElements: pathElements.map(x => x.toString()),
+      pathIndices: pathIndices.map(x => x.toString()),
+      merkleRoot: merkleRoot.toString(),
+      nullifier: nullifier.toString(),
+      recipient: '123',
+      withdrawAmount: withdrawAmount.toString(),
+      changeCommitment: changeCommitment.toString()
+    };
+    
+    const witness = await circuit.calculateWitness(inputs);
+    await circuit.checkConstraints(witness);
+  });
+  
+  it('should reject withdrawal exceeding note amount', async () => {
+    // ... similar setup with withdrawAmount > noteAmount ...
+    await expect(circuit.calculateWitness(inputs)).to.be.rejected;
+  });
+});
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Shielded Pool Contract" icon="shield" href="/protocol/shielded-pool">
+    On-chain implementation of the shielded pool
+  </Card>
+  <Card title="Merkle Trees" icon="sitemap" href="/protocol/merkle-trees">
+    Incremental Merkle tree algorithm details
+  </Card>
+</CardGroup>

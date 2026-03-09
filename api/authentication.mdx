@@ -1,0 +1,202 @@
+---
+title: 'Authentication'
+description: 'API authentication methods and security'
+---
+
+## Overview
+
+The identiPay API uses two authentication models:
+
+1. **No Authentication**: Public endpoints (name resolution, intent lookup, announcements)
+2. **API Key Authentication**: Merchant-specific endpoints (proposal creation, transaction status)
+
+## API Key Authentication
+
+### How It Works
+
+Merchant endpoints require a Bearer token in the `Authorization` header.
+
+The API key is:
+- Generated during merchant registration
+- Hashed using SHA-256 before storage
+- Validated on each request by comparing the hash
+
+### Implementation
+
+The authentication middleware is implemented in `middleware/api-key.ts:8-39`:
+
+```typescript
+export function apiKeyAuth(db: Db) {
+  return async (c: Context, next: Next) => {
+    const authHeader = c.req.header("Authorization");
+    if (!authHeader?.startsWith("Bearer ")) {
+      throw new AuthError("Missing or invalid Authorization header");
+    }
+
+    const apiKey = authHeader.slice(7);
+    const keyHash = hashApiKey(apiKey);
+
+    const [merchant] = await db
+      .select()
+      .from(merchants)
+      .where(eq(merchants.apiKeyHash, keyHash))
+      .limit(1);
+
+    if (!merchant) {
+      throw new AuthError("Invalid API key");
+    }
+
+    if (!merchant.active) {
+      throw new AuthError("Merchant account is deactivated");
+    }
+
+    c.set("merchant", merchant);
+    await next();
+  };
+}
+```
+
+### Getting an API Key
+
+Merchants receive an API key when registering:
+
+```bash
+POST /api/identipay/v1/merchants/register
+```
+
+**Response**:
+```json
+{
+  "id": "merchant-uuid",
+  "did": "did:identipay:merchant.com:uuid",
+  "apiKey": "ip_live_abc123..."
+}
+```
+
+<Warning>
+  The API key is only shown once during registration. Store it securely.
+</Warning>
+
+### Using the API Key
+
+Include the API key in the `Authorization` header:
+
+```bash
+curl -X POST https://api.identipay.com/api/identipay/v1/proposals \
+  -H "Authorization: Bearer ip_live_abc123..." \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+```
+
+## Protected Endpoints
+
+The following endpoints require API key authentication:
+
+| Endpoint | Method | Resource |
+|----------|--------|----------|
+| `/proposals` | POST | Create proposal |
+| `/transactions/:txId/status` | GET | Check transaction status |
+
+## Public Endpoints
+
+The following endpoints do NOT require authentication:
+
+| Endpoint | Method | Resource |
+|----------|--------|----------|
+| `/merchants/by-address/:suiAddress` | GET | Merchant lookup |
+| `/intents/:txId` | GET | Resolve proposal by transaction ID |
+| `/names/:name` | GET | Resolve name to meta-address |
+| `/names/register` | POST | Register a new name |
+| `/announcements` | GET | Query stealth announcements |
+| `/pay-requests` | POST | Create payment request |
+| `/pay-requests/:requestId` | GET | Get payment request |
+| `/transactions/gas-sponsor` | POST | Build sponsored transaction |
+| `/transactions/submit` | POST | Submit signed transaction |
+| `/transactions/submit-pool` | POST | Submit pool transaction |
+
+## Security Best Practices
+
+### API Key Storage
+
+<Warning>
+  Never expose API keys in:
+  - Client-side code
+  - Public repositories
+  - Browser environments
+  - Version control systems
+</Warning>
+
+Store API keys in:
+- Environment variables
+- Secure key management systems
+- Server-side configuration files (with restricted access)
+
+### Key Rotation
+
+Currently, API key rotation is not supported. To rotate keys:
+
+1. Register a new merchant account
+2. Migrate to the new API key
+3. Deactivate the old merchant account
+
+### HTTPS Only
+
+<Warning>
+  Always use HTTPS in production to prevent API key interception.
+</Warning>
+
+## Error Responses
+
+### Missing Authorization Header
+
+**Status**: `401 Unauthorized`
+
+```json
+{
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "Missing or invalid Authorization header"
+  }
+}
+```
+
+### Invalid API Key
+
+**Status**: `401 Unauthorized`
+
+```json
+{
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "Invalid API key"
+  }
+}
+```
+
+### Deactivated Merchant
+
+**Status**: `401 Unauthorized`
+
+```json
+{
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "Merchant account is deactivated"
+  }
+}
+```
+
+## Privacy Considerations
+
+### No Wallet Authentication
+
+Wallet endpoints (gas sponsorship, name registration) do NOT require authentication to preserve user privacy.
+
+The backend:
+- Cannot link transactions to specific wallets
+- Does not track user behavior
+- Only sees stealth addresses and public keys
+
+### View Tag Privacy
+
+The `/announcements` endpoint allows optional `viewTag` filtering, but wallets SHOULD fetch all announcements and filter locally to avoid revealing their view tag set to the backend (privacy invariant #5).

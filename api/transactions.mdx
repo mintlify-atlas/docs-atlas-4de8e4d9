@@ -1,0 +1,608 @@
+---
+title: 'Transactions'
+description: 'Gas-sponsored transaction building and submission'
+---
+
+## Overview
+
+The transactions API provides gas sponsorship for all wallet operations. The backend builds transaction bytes, sponsors gas, and co-signs transactions.
+
+<Info>
+  Wallet endpoints are public (no authentication). Status endpoint requires API key.
+</Info>
+
+## Gas Sponsorship Flow
+
+All wallet transactions follow a two-step flow:
+
+1. **Build**: Wallet sends transaction parameters to `/transactions/gas-sponsor`
+2. **Submit**: Wallet signs transaction bytes and submits via `/transactions/submit`
+
+The backend acts as the gas sponsor, co-signing the transaction.
+
+## Endpoints
+
+### Build Sponsored Transaction
+
+Build a gas-sponsored transaction and return transaction bytes for signing.
+
+```http
+POST /api/identipay/v1/transactions/gas-sponsor
+```
+
+#### Request Body
+
+<ParamField body="type" type="string" required>
+  Transaction type: `send`, `settlement`, `settlement_no_zk`, `pool_deposit`, or `pool_withdraw`
+</ParamField>
+
+<ParamField body="senderAddress" type="string" required>
+  Sender's Sui address
+</ParamField>
+
+#### Additional Parameters by Type
+
+<Expandable title="send - Stealth Transfer">
+  <ParamField body="coinId" type="string">
+    Specific coin object ID to spend (optional)
+  </ParamField>
+  
+  <ParamField body="amount" type="string" required>
+    Amount to send
+  </ParamField>
+  
+  <ParamField body="recipient" type="string" required>
+    Recipient stealth address
+  </ParamField>
+  
+  <ParamField body="coinType" type="string" required>
+    Coin type (e.g., `0x2::sui::SUI`)
+  </ParamField>
+  
+  <ParamField body="ephemeralPubkey" type="array" required>
+    Ephemeral public key (byte array)
+  </ParamField>
+  
+  <ParamField body="viewTag" type="number" default="0">
+    View tag (0-255) for recipient filtering
+  </ParamField>
+</Expandable>
+
+<Expandable title="settlement / settlement_no_zk - Pay Merchant">
+  <ParamField body="coinId" type="string">
+    Specific coin object ID to spend (optional)
+  </ParamField>
+  
+  <ParamField body="coinType" type="string" required>
+    Coin type (e.g., `0x2::sui::SUI`)
+  </ParamField>
+  
+  <ParamField body="amount" type="string" required>
+    Payment amount
+  </ParamField>
+  
+  <ParamField body="merchantAddress" type="string" required>
+    Merchant's Sui address
+  </ParamField>
+  
+  <ParamField body="buyerStealthAddr" type="string" required>
+    Buyer's stealth address for this transaction
+  </ParamField>
+  
+  <ParamField body="intentSig" type="array" required>
+    Intent signature (byte array)
+  </ParamField>
+  
+  <ParamField body="intentHash" type="array" required>
+    Intent hash (byte array)
+  </ParamField>
+  
+  <ParamField body="buyerPubkey" type="array" required>
+    Buyer's public key (byte array)
+  </ParamField>
+  
+  <ParamField body="proposalExpiry" type="string" required>
+    Proposal expiry timestamp
+  </ParamField>
+  
+  <ParamField body="encryptedPayload" type="array" required>
+    Encrypted receipt payload (byte array)
+  </ParamField>
+  
+  <ParamField body="payloadNonce" type="array" required>
+    Nonce for payload encryption (byte array)
+  </ParamField>
+  
+  <ParamField body="ephemeralPubkey" type="array" required>
+    Ephemeral pubkey for stealth announcement (byte array)
+  </ParamField>
+  
+  <ParamField body="encryptedWarrantyTerms" type="array">
+    Encrypted warranty terms (byte array, optional)
+  </ParamField>
+  
+  <ParamField body="warrantyTermsNonce" type="array">
+    Warranty nonce (byte array, optional)
+  </ParamField>
+  
+  <ParamField body="warrantyExpiry" type="string" default="0">
+    Warranty expiry timestamp
+  </ParamField>
+  
+  <ParamField body="warrantyTransferable" type="boolean" default="false">
+    Whether warranty is transferable
+  </ParamField>
+  
+  <ParamField body="stealthEphemeralPubkey" type="array">
+    Stealth ephemeral pubkey (byte array, optional)
+  </ParamField>
+  
+  <ParamField body="stealthViewTag" type="number" default="0">
+    Stealth view tag
+  </ParamField>
+  
+  <ParamField body="zkProof" type="array">
+    ZK proof for age gate (byte array, required for `settlement`, optional for `settlement_no_zk`)
+  </ParamField>
+  
+  <ParamField body="zkPublicInputs" type="array">
+    ZK public inputs (byte array, required for `settlement`, optional for `settlement_no_zk`)
+  </ParamField>
+</Expandable>
+
+<Expandable title="pool_deposit - Shielded Pool Deposit">
+  <ParamField body="coinType" type="string" required>
+    Coin type
+  </ParamField>
+  
+  <ParamField body="amount" type="string" required>
+    Deposit amount
+  </ParamField>
+  
+  <ParamField body="ephemeralPubkey" type="array" required>
+    Note commitment (byte array)
+  </ParamField>
+</Expandable>
+
+<Expandable title="pool_withdraw - Shielded Pool Withdrawal">
+  <ParamField body="coinType" type="string" required>
+    Coin type
+  </ParamField>
+  
+  <ParamField body="amount" type="string" required>
+    Withdrawal amount
+  </ParamField>
+  
+  <ParamField body="recipient" type="string" required>
+    Recipient address
+  </ParamField>
+  
+  <ParamField body="nullifier" type="array" required>
+    Nullifier (byte array)
+  </ParamField>
+  
+  <ParamField body="changeCommitment" type="array" required>
+    Change commitment (byte array)
+  </ParamField>
+  
+  <ParamField body="zkProof" type="array" required>
+    ZK proof (byte array)
+  </ParamField>
+  
+  <ParamField body="zkPublicInputs" type="array" required>
+    ZK public inputs (byte array)
+  </ParamField>
+</Expandable>
+
+#### Response
+
+<ResponseField name="txBytes" type="string">
+  Base64-encoded transaction bytes ready for signing
+</ResponseField>
+
+#### Example Request
+
+<CodeGroup>
+```bash cURL (Send)
+curl -X POST https://api.identipay.com/api/identipay/v1/transactions/gas-sponsor \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "send",
+    "senderAddress": "0xabc123...",
+    "amount": "1000000000",
+    "recipient": "0xdef456...",
+    "coinType": "0x2::sui::SUI",
+    "ephemeralPubkey": [1,2,3,...],
+    "viewTag": 42
+  }'
+```
+
+```typescript TypeScript (Settlement)
+const response = await fetch(
+  'https://api.identipay.com/api/identipay/v1/transactions/gas-sponsor',
+  {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      type: 'settlement',
+      senderAddress: '0xabc123...',
+      coinType: '0x2::sui::SUI',
+      amount: '10000000000',
+      merchantAddress: '0xmerchant...',
+      buyerStealthAddr: '0xstealth...',
+      intentSig: [...],
+      intentHash: [...],
+      buyerPubkey: [...],
+      proposalExpiry: '1678901234',
+      encryptedPayload: [...],
+      payloadNonce: [...],
+      ephemeralPubkey: [...],
+      zkProof: [...],
+      zkPublicInputs: [...]
+    })
+  }
+);
+const { txBytes } = await response.json();
+```
+</CodeGroup>
+
+#### Example Response
+
+```json
+{
+  "txBytes": "AAACAAgA...(base64-encoded)..."
+}
+```
+
+#### Error Responses
+
+<Expandable title="400 Validation Error">
+  Missing required parameters or invalid transaction type.
+  
+  ```json
+  {
+    "error": {
+      "code": "VALIDATION_ERROR",
+      "message": "Missing required send parameters"
+    }
+  }
+  ```
+</Expandable>
+
+<Expandable title="500 Sui Error">
+  Failed to build transaction.
+  
+  ```json
+  {
+    "error": {
+      "code": "SUI_ERROR",
+      "message": "Failed to build sponsored transaction",
+      "details": {...}
+    }
+  }
+  ```
+</Expandable>
+
+---
+
+### Submit Signed Transaction
+
+Submit a signed transaction for co-signing and broadcasting.
+
+```http
+POST /api/identipay/v1/transactions/submit
+```
+
+#### Request Body
+
+<ParamField body="txBytes" type="string" required>
+  Base64-encoded transaction bytes (from `/gas-sponsor`)
+</ParamField>
+
+<ParamField body="senderSignature" type="string" required>
+  Base64-encoded sender signature
+</ParamField>
+
+#### Response
+
+<ResponseField name="txDigest" type="string">
+  Sui transaction digest (hash)
+</ResponseField>
+
+#### Example Request
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.identipay.com/api/identipay/v1/transactions/submit \
+  -H "Content-Type: application/json" \
+  -d '{
+    "txBytes": "AAACAAgA...",
+    "senderSignature": "ABC123..."
+  }'
+```
+
+```typescript TypeScript
+// 1. Get transaction bytes
+const { txBytes } = await buildSponsored(...);
+
+// 2. Sign with wallet
+const senderSignature = await wallet.signTransaction(txBytes);
+
+// 3. Submit for co-signing
+const response = await fetch(
+  'https://api.identipay.com/api/identipay/v1/transactions/submit',
+  {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ txBytes, senderSignature })
+  }
+);
+const { txDigest } = await response.json();
+```
+</CodeGroup>
+
+#### Example Response
+
+```json
+{
+  "txDigest": "9x4Kb2FgH8..."
+}
+```
+
+#### Error Responses
+
+<Expandable title="400 Validation Error">
+  Missing txBytes or senderSignature.
+  
+  ```json
+  {
+    "error": {
+      "code": "VALIDATION_ERROR",
+      "message": "txBytes and senderSignature are required"
+    }
+  }
+  ```
+</Expandable>
+
+<Expandable title="500 Sui Error">
+  Failed to submit transaction.
+  
+  ```json
+  {
+    "error": {
+      "code": "SUI_ERROR",
+      "message": "Failed to submit transaction",
+      "details": {...}
+    }
+  }
+  ```
+</Expandable>
+
+---
+
+### Submit Pool Transaction
+
+Submit a pool withdrawal transaction (backend signs as both sender and gas sponsor).
+
+```http
+POST /api/identipay/v1/transactions/submit-pool
+```
+
+<Info>
+  Used for shielded pool withdrawals where the backend controls the pool account.
+</Info>
+
+#### Request Body
+
+<ParamField body="txBytes" type="string" required>
+  Base64-encoded transaction bytes (from `/gas-sponsor` with `type=pool_withdraw`)
+</ParamField>
+
+#### Response
+
+<ResponseField name="txDigest" type="string">
+  Sui transaction digest
+</ResponseField>
+
+#### Example Request
+
+<CodeGroup>
+```bash cURL
+curl -X POST https://api.identipay.com/api/identipay/v1/transactions/submit-pool \
+  -H "Content-Type: application/json" \
+  -d '{
+    "txBytes": "AAACAAgA..."
+  }'
+```
+
+```typescript TypeScript
+const { txBytes } = await buildPoolWithdraw(...);
+
+const response = await fetch(
+  'https://api.identipay.com/api/identipay/v1/transactions/submit-pool',
+  {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ txBytes })
+  }
+);
+const { txDigest } = await response.json();
+```
+</CodeGroup>
+
+#### Example Response
+
+```json
+{
+  "txDigest": "7yZ3Jb1Hf9..."
+}
+```
+
+---
+
+### Get Transaction Status
+
+Check the status of a proposal/transaction (merchant endpoint).
+
+```http
+GET /api/identipay/v1/transactions/:txId/status
+```
+
+<Info>
+  Requires `Authorization: Bearer {apiKey}` header
+</Info>
+
+#### Path Parameters
+
+<ParamField path="txId" type="string" required>
+  Transaction ID (UUID)
+</ParamField>
+
+#### Response
+
+<ResponseField name="transactionId" type="string">
+  Transaction UUID
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Status: `pending`, `settled`, `expired`, or `cancelled`
+</ResponseField>
+
+<ResponseField name="suiTxDigest" type="string">
+  Sui transaction digest (if settled)
+</ResponseField>
+
+<ResponseField name="settledAt" type="string">
+  ISO 8601 timestamp when settled (if settled)
+</ResponseField>
+
+#### Example Request
+
+<CodeGroup>
+```bash cURL
+curl https://api.identipay.com/api/identipay/v1/transactions/550e8400-.../status \
+  -H "Authorization: Bearer ip_live_abc123..."
+```
+
+```typescript TypeScript
+const txId = '550e8400-e29b-41d4-a716-446655440000';
+const response = await fetch(
+  `https://api.identipay.com/api/identipay/v1/transactions/${txId}/status`,
+  {
+    headers: {
+      'Authorization': 'Bearer ip_live_abc123...'
+    }
+  }
+);
+const status = await response.json();
+```
+</CodeGroup>
+
+#### Example Response
+
+```json
+{
+  "transactionId": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "settled",
+  "suiTxDigest": "9x4Kb2FgH8...",
+  "settledAt": "2026-03-09T20:15:32.000Z"
+}
+```
+
+#### Error Responses
+
+<Expandable title="401 Unauthorized">
+  Missing or invalid API key.
+  
+  ```json
+  {
+    "error": {
+      "code": "UNAUTHORIZED",
+      "message": "Invalid API key"
+    }
+  }
+  ```
+</Expandable>
+
+<Expandable title="404 Not Found">
+  Transaction not found or not owned by this merchant.
+  
+  ```json
+  {
+    "error": {
+      "code": "NOT_FOUND",
+      "message": "Transaction not found"
+    }
+  }
+  ```
+</Expandable>
+
+## Implementation Details
+
+### Gas Sponsorship Architecture
+
+The backend uses Sui's sponsored transaction feature:
+
+1. **Build Phase**: Backend constructs a `TransactionBlock` with itself as the gas sponsor
+2. **Sign Phase**: Wallet signs as the sender
+3. **Co-Sign Phase**: Backend signs as the gas sponsor and submits
+
+This allows users to transact without holding SUI for gas.
+
+### Security Model
+
+The backend:
+- Only sponsors valid transaction types (whitelist)
+- Validates all transaction parameters
+- Never accesses user funds (users control their own keys)
+- Only pays gas fees
+
+### Settlement Flow
+
+For a complete payment settlement:
+
+1. **Fetch Proposal**: Wallet calls `/intents/:txId`
+2. **Verify Intent**: Wallet validates merchant signature and intent hash
+3. **Generate Stealth Address**: Wallet creates buyer stealth address
+4. **Build Settlement**: Call `/transactions/gas-sponsor` with `type=settlement`
+5. **Sign Transaction**: Wallet signs with user's key
+6. **Submit**: Call `/transactions/submit`
+7. **Monitor**: Connect to WebSocket for real-time updates
+
+See [WebSocket](/api/websocket) for monitoring settlement status.
+
+### Background Settlement Indexer
+
+The backend polls for `SettlementEvent` events every 3 seconds:
+
+```typescript
+async function pollSettlementEvents() {
+  const result = await suiService.pollSettlementEvents(cursor);
+  
+  for (const event of result.events) {
+    const [proposal] = await db
+      .select()
+      .from(proposals)
+      .where(eq(proposals.intentHash, event.intentHash));
+    
+    if (proposal && proposal.status === "pending") {
+      await db
+        .update(proposals)
+        .set({ status: "settled", suiTxDigest: event.txDigest });
+      
+      pushSettlementUpdate(proposal.transactionId, "settled", event.txDigest);
+    }
+  }
+}
+```
+
+When a settlement is detected:
+1. Update proposal status to `settled`
+2. Store Sui transaction digest
+3. Push update to all connected WebSocket clients
+
+## Related Endpoints
+
+- [Proposals](/api/proposals) - Create proposals
+- [Intents](/api/intents) - Resolve proposals
+- [WebSocket](/api/websocket) - Real-time status updates

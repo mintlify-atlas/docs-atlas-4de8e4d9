@@ -1,0 +1,503 @@
+---
+title: 'WebSocket'
+description: 'Real-time transaction status updates'
+---
+
+## Overview
+
+The WebSocket API provides real-time updates for transaction status. Merchants can connect to receive instant notifications when proposals are settled.
+
+<Info>
+  WebSocket connections do not require authentication but are scoped to a specific transaction ID.
+</Info>
+
+## Connection
+
+### WebSocket URL
+
+```
+wss://<hostname>/ws/transactions/:txId
+```
+
+For local development:
+```
+ws://localhost:8000/ws/transactions/:txId
+```
+
+### Path Parameters
+
+<ParamField path="txId" type="string" required>
+  Transaction ID (UUID) to monitor
+</ParamField>
+
+## Message Format
+
+All messages are JSON-encoded.
+
+### Incoming Messages
+
+Messages sent from the server to the client.
+
+#### Status Message
+
+<ResponseField name="type" type="string">
+  Message type (`status`)
+</ResponseField>
+
+<ResponseField name="transactionId" type="string">
+  Transaction UUID
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Current status: `pending`, `settled`, `expired`, or `cancelled`
+</ResponseField>
+
+<ResponseField name="suiTxDigest" type="string">
+  Sui transaction digest (if settled)
+</ResponseField>
+
+**Example**:
+```json
+{
+  "type": "status",
+  "transactionId": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "pending",
+  "suiTxDigest": null
+}
+```
+
+#### Settlement Message
+
+<ResponseField name="type" type="string">
+  Message type (`settlement`)
+</ResponseField>
+
+<ResponseField name="transactionId" type="string">
+  Transaction UUID
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  New status (`settled`)
+</ResponseField>
+
+<ResponseField name="suiTxDigest" type="string">
+  Sui transaction digest
+</ResponseField>
+
+<Warning>
+  The buyer's stealth address is NOT included in settlement messages to preserve privacy.
+</Warning>
+
+**Example**:
+```json
+{
+  "type": "settlement",
+  "transactionId": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "settled",
+  "suiTxDigest": "9x4Kb2FgH8..."
+}
+```
+
+#### Error Message
+
+<ResponseField name="type" type="string">
+  Message type (`error`)
+</ResponseField>
+
+<ResponseField name="message" type="string">
+  Error description
+</ResponseField>
+
+**Example**:
+```json
+{
+  "type": "error",
+  "message": "Transaction not found"
+}
+```
+
+### Outgoing Messages
+
+Clients do not send messages to the server. The WebSocket is read-only.
+
+## Usage Examples
+
+### JavaScript/TypeScript
+
+<CodeGroup>
+```typescript Basic Connection
+const txId = '550e8400-e29b-41d4-a716-446655440000';
+const ws = new WebSocket(`wss://api.identipay.com/ws/transactions/${txId}`);
+
+ws.onopen = () => {
+  console.log('Connected to WebSocket');
+};
+
+ws.onmessage = (event) => {
+  const message = JSON.parse(event.data);
+  
+  if (message.type === 'status') {
+    console.log('Current status:', message.status);
+  } else if (message.type === 'settlement') {
+    console.log('Payment settled!', message.suiTxDigest);
+    // Update UI, notify merchant, etc.
+  } else if (message.type === 'error') {
+    console.error('Error:', message.message);
+  }
+};
+
+ws.onerror = (error) => {
+  console.error('WebSocket error:', error);
+};
+
+ws.onclose = () => {
+  console.log('WebSocket closed');
+};
+```
+
+```typescript React Hook
+import { useEffect, useState } from 'react';
+
+function useTransactionStatus(txId: string) {
+  const [status, setStatus] = useState<string>('connecting');
+  const [txDigest, setTxDigest] = useState<string | null>(null);
+  
+  useEffect(() => {
+    const ws = new WebSocket(
+      `wss://api.identipay.com/ws/transactions/${txId}`
+    );
+    
+    ws.onopen = () => setStatus('connected');
+    
+    ws.onmessage = (event) => {
+      const message = JSON.parse(event.data);
+      
+      if (message.type === 'status' || message.type === 'settlement') {
+        setStatus(message.status);
+        if (message.suiTxDigest) {
+          setTxDigest(message.suiTxDigest);
+        }
+      }
+    };
+    
+    ws.onerror = () => setStatus('error');
+    ws.onclose = () => setStatus('closed');
+    
+    return () => ws.close();
+  }, [txId]);
+  
+  return { status, txDigest };
+}
+
+// Usage in component
+function PaymentMonitor({ txId }: { txId: string }) {
+  const { status, txDigest } = useTransactionStatus(txId);
+  
+  return (
+    <div>
+      <p>Status: {status}</p>
+      {txDigest && <p>Transaction: {txDigest}</p>}
+    </div>
+  );
+}
+```
+
+```typescript Auto-Reconnect
+function connectWithRetry(
+  txId: string,
+  onMessage: (msg: any) => void,
+  maxRetries = 5
+) {
+  let retries = 0;
+  let ws: WebSocket | null = null;
+  
+  function connect() {
+    ws = new WebSocket(`wss://api.identipay.com/ws/transactions/${txId}`);
+    
+    ws.onopen = () => {
+      console.log('Connected');
+      retries = 0; // Reset retry counter on success
+    };
+    
+    ws.onmessage = (event) => {
+      const message = JSON.parse(event.data);
+      onMessage(message);
+    };
+    
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+    };
+    
+    ws.onclose = () => {
+      console.log('Connection closed');
+      
+      // Attempt to reconnect
+      if (retries < maxRetries) {
+        retries++;
+        const delay = Math.min(1000 * Math.pow(2, retries), 30000);
+        console.log(`Reconnecting in ${delay}ms...`);
+        setTimeout(connect, delay);
+      } else {
+        console.error('Max retries reached');
+      }
+    };
+  }
+  
+  connect();
+  
+  return () => {
+    if (ws) {
+      ws.close();
+    }
+  };
+}
+
+// Usage
+const cleanup = connectWithRetry(
+  '550e8400-e29b-41d4-a716-446655440000',
+  (message) => {
+    if (message.type === 'settlement') {
+      console.log('Payment confirmed!');
+      cleanup(); // Close connection after settlement
+    }
+  }
+);
+```
+</CodeGroup>
+
+### Python
+
+```python
+import asyncio
+import json
+import websockets
+
+async def monitor_transaction(tx_id: str):
+    uri = f"wss://api.identipay.com/ws/transactions/{tx_id}"
+    
+    async with websockets.connect(uri) as websocket:
+        print(f"Connected to {uri}")
+        
+        async for message in websocket:
+            data = json.loads(message)
+            
+            if data['type'] == 'status':
+                print(f"Status: {data['status']}")
+            elif data['type'] == 'settlement':
+                print(f"Settled! Digest: {data['suiTxDigest']}")
+                break  # Close after settlement
+            elif data['type'] == 'error':
+                print(f"Error: {data['message']}")
+                break
+
+# Run
+asyncio.run(monitor_transaction('550e8400-e29b-41d4-a716-446655440000'))
+```
+
+## Implementation Details
+
+### Server-Side Architecture
+
+The WebSocket handler (see `ws/status.ts:17-42`) maintains a map of connections:
+
+```typescript
+// Map of transactionId -> set of WebSocket connections
+const connections = new Map<string, Set<WsConnection>>();
+
+export function handleWsConnection(
+  txId: string,
+  ws: WsConnection,
+  db: Db,
+  onCleanup?: () => void
+) {
+  if (!connections.has(txId)) {
+    connections.set(txId, new Set());
+  }
+  connections.get(txId)!.add(ws);
+  
+  // Send current status on connect
+  sendCurrentStatus(txId, ws, db);
+  
+  // Return cleanup function
+  return () => {
+    const set = connections.get(txId);
+    if (set) {
+      set.delete(ws);
+      if (set.size === 0) {
+        connections.delete(txId);
+      }
+    }
+    onCleanup?.();
+  };
+}
+```
+
+### Settlement Broadcasting
+
+When the settlement indexer detects a payment (see `ws/status.ts:81-103`):
+
+```typescript
+export function pushSettlementUpdate(
+  txId: string,
+  status: string,
+  suiTxDigest: string
+) {
+  const set = connections.get(txId);
+  if (!set) return;
+  
+  const message = JSON.stringify({
+    type: 'settlement',
+    transactionId: txId,
+    status,
+    suiTxDigest
+  });
+  
+  for (const ws of set) {
+    try {
+      ws.send(message);
+    } catch {
+      set.delete(ws);
+    }
+  }
+}
+```
+
+### Initial Status
+
+On connection, the server immediately sends the current status:
+
+```typescript
+async function sendCurrentStatus(txId: string, ws: WsConnection, db: Db) {
+  const [proposal] = await db
+    .select()
+    .from(proposals)
+    .where(eq(proposals.transactionId, txId));
+  
+  if (proposal) {
+    ws.send(JSON.stringify({
+      type: 'status',
+      transactionId: proposal.transactionId,
+      status: proposal.status,
+      suiTxDigest: proposal.suiTxDigest
+    }));
+  } else {
+    ws.send(JSON.stringify({
+      type: 'error',
+      message: 'Transaction not found'
+    }));
+  }
+}
+```
+
+### Connection Lifecycle
+
+1. **Connect**: Client opens WebSocket connection with transaction ID
+2. **Initial Status**: Server sends current proposal status
+3. **Monitor**: Server monitors for settlement events
+4. **Broadcast**: When settled, server pushes update to all connected clients
+5. **Close**: Client or server closes connection
+6. **Cleanup**: Server removes connection from tracking map
+
+## Privacy Considerations
+
+<Warning>
+  Settlement messages do NOT include the buyer's stealth address.
+</Warning>
+
+Merchants receive:
+- Transaction ID
+- Settlement status
+- Sui transaction digest
+
+Merchants do NOT receive:
+- Buyer's wallet address
+- Buyer's stealth address
+- Buyer's identity information
+
+This preserves buyer privacy while allowing merchants to confirm payment.
+
+## Connection Limits
+
+Currently, there are no enforced connection limits. Future versions may limit:
+- Connections per transaction
+- Connections per IP
+- Total concurrent connections
+
+## Monitoring
+
+The server tracks active connections:
+
+```typescript
+export function getActiveConnectionCount(): number {
+  let count = 0;
+  for (const set of connections.values()) {
+    count += set.size;
+  }
+  return count;
+}
+```
+
+This can be used for monitoring and alerting.
+
+## Best Practices
+
+<Check>
+  Connect to WebSocket only after creating/resolving a proposal
+</Check>
+
+<Check>
+  Implement auto-reconnect with exponential backoff
+</Check>
+
+<Check>
+  Close connection after receiving settlement notification
+</Check>
+
+<Check>
+  Fall back to polling `/transactions/:txId/status` if WebSocket fails
+</Check>
+
+<Warning>
+  WebSocket connections consume server resources. Close unused connections.
+</Warning>
+
+## Fallback: Polling
+
+If WebSocket is unavailable, poll the status endpoint:
+
+```typescript
+async function pollTransactionStatus(
+  txId: string,
+  apiKey: string,
+  onUpdate: (status: any) => void
+) {
+  const intervalId = setInterval(async () => {
+    try {
+      const response = await fetch(
+        `https://api.identipay.com/api/identipay/v1/transactions/${txId}/status`,
+        {
+          headers: { 'Authorization': `Bearer ${apiKey}` }
+        }
+      );
+      const status = await response.json();
+      
+      onUpdate(status);
+      
+      // Stop polling if settled/expired/cancelled
+      if (status.status !== 'pending') {
+        clearInterval(intervalId);
+      }
+    } catch (error) {
+      console.error('Polling error:', error);
+    }
+  }, 3000); // Poll every 3 seconds
+  
+  return () => clearInterval(intervalId);
+}
+```
+
+## Related Endpoints
+
+- [Proposals](/api/proposals) - Create proposals to monitor
+- [Transactions](/api/transactions) - Check status via REST API
+- [Intents](/api/intents) - Resolve proposals for settlement

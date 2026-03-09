@@ -1,0 +1,333 @@
+---
+title: 'Announcements'
+description: 'Query stealth address announcements'
+---
+
+## Overview
+
+The announcements API provides access to stealth address announcements. When a payment is sent to a stealth address, an announcement is published on-chain and indexed by the backend.
+
+Wallets scan announcements to detect incoming payments.
+
+<Info>
+  This endpoint is public and does not require authentication.
+</Info>
+
+## Privacy Considerations
+
+<Warning>
+  The `viewTag` filter is OPTIONAL. Wallets SHOULD fetch all announcements and filter locally to avoid revealing their view tag set to the backend (privacy invariant #5).
+</Warning>
+
+Fetching all announcements:
+- Preserves privacy by not revealing which view tags you're interested in
+- Allows backend to serve cached results efficiently
+- Prevents traffic analysis attacks
+
+## Endpoints
+
+### Query Announcements
+
+Query stealth announcements with optional filters.
+
+```http
+GET /api/identipay/v1/announcements
+```
+
+#### Query Parameters
+
+<ParamField query="since" type="string">
+  ISO 8601 timestamp - only return announcements after this time
+</ParamField>
+
+<ParamField query="viewTag" type="integer">
+  View tag filter (0-255) - OPTIONAL for privacy
+</ParamField>
+
+<ParamField query="limit" type="integer" default={100}>
+  Number of results to return (1-1000)
+</ParamField>
+
+<ParamField query="cursor" type="string">
+  Pagination cursor (UUID from previous response)
+</ParamField>
+
+#### Response
+
+<ResponseField name="announcements" type="array">
+  Array of announcement objects
+  
+  <Expandable title="Announcement Schema">
+    <ResponseField name="id" type="string">
+      Announcement ID (UUID)
+    </ResponseField>
+    
+    <ResponseField name="ephemeralPubkey" type="string">
+      Ephemeral public key (hex string)
+    </ResponseField>
+    
+    <ResponseField name="viewTag" type="number">
+      View tag (0-255)
+    </ResponseField>
+    
+    <ResponseField name="stealthAddress" type="string">
+      Stealth address that received payment
+    </ResponseField>
+    
+    <ResponseField name="metadata" type="string">
+      Optional metadata (encrypted payload)
+    </ResponseField>
+    
+    <ResponseField name="txDigest" type="string">
+      Sui transaction digest
+    </ResponseField>
+    
+    <ResponseField name="timestamp" type="string">
+      ISO 8601 timestamp
+    </ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="nextCursor" type="string">
+  Cursor for next page (null if no more results)
+</ResponseField>
+
+#### Example Request
+
+<CodeGroup>
+```bash cURL (All Announcements)
+curl "https://api.identipay.com/api/identipay/v1/announcements?limit=100"
+```
+
+```bash cURL (Since Timestamp)
+curl "https://api.identipay.com/api/identipay/v1/announcements?since=2026-03-09T20:00:00Z&limit=50"
+```
+
+```bash cURL (With View Tag - Not Recommended)
+curl "https://api.identipay.com/api/identipay/v1/announcements?viewTag=42&limit=100"
+```
+
+```typescript TypeScript (Privacy-Preserving)
+// Fetch all announcements (privacy-preserving)
+const response = await fetch(
+  'https://api.identipay.com/api/identipay/v1/announcements?limit=1000'
+);
+const { announcements, nextCursor } = await response.json();
+
+// Filter locally by view tag
+const myViewTags = [42, 99, 156];
+const relevant = announcements.filter(a => myViewTags.includes(a.viewTag));
+```
+
+```typescript TypeScript (Pagination)
+let cursor = null;
+const allAnnouncements = [];
+
+do {
+  const url = cursor
+    ? `https://api.identipay.com/api/identipay/v1/announcements?cursor=${cursor}&limit=100`
+    : 'https://api.identipay.com/api/identipay/v1/announcements?limit=100';
+  
+  const response = await fetch(url);
+  const { announcements, nextCursor } = await response.json();
+  
+  allAnnouncements.push(...announcements);
+  cursor = nextCursor;
+} while (cursor);
+```
+</CodeGroup>
+
+#### Example Response
+
+```json
+{
+  "announcements": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "ephemeralPubkey": "a1b2c3d4e5f6...",
+      "viewTag": 42,
+      "stealthAddress": "0xstealth123...",
+      "metadata": "encrypted_payload_hex...",
+      "txDigest": "9x4Kb2FgH8...",
+      "timestamp": "2026-03-09T20:15:32.000Z"
+    },
+    {
+      "id": "650e8400-e29b-41d4-a716-446655440001",
+      "ephemeralPubkey": "f6e5d4c3b2a1...",
+      "viewTag": 99,
+      "stealthAddress": "0xstealth456...",
+      "metadata": null,
+      "txDigest": "7yZ3Jb1Hf9...",
+      "timestamp": "2026-03-09T20:16:45.000Z"
+    }
+  ],
+  "nextCursor": "750e8400-e29b-41d4-a716-446655440002"
+}
+```
+
+#### Error Responses
+
+<Expandable title="400 Validation Error">
+  Invalid query parameters.
+  
+  ```json
+  {
+    "error": {
+      "code": "VALIDATION_ERROR",
+      "message": "Invalid query parameters",
+      "details": {
+        "fieldErrors": {
+          "viewTag": ["Number must be less than or equal to 255"],
+          "limit": ["Number must be less than or equal to 1000"]
+        }
+      }
+    }
+  }
+  ```
+</Expandable>
+
+## Implementation Details
+
+### Announcement Indexing
+
+The backend runs a background indexer that polls for `StealthAnnouncement` events every 3 seconds:
+
+```typescript
+async function pollAnnouncementEvents() {
+  let cursor = await loadCursor(ANNOUNCEMENT_CURSOR_KEY);
+  
+  const result = await suiService.pollAnnouncementEvents(cursor);
+  
+  for (const event of result.events) {
+    await db.insert(announcements).values({
+      ephemeralPubkey: event.ephemeralPubkey,
+      viewTag: event.viewTag,
+      stealthAddress: event.stealthAddress,
+      metadata: event.metadata,
+      txDigest: event.txDigest,
+      timestamp: new Date(parseInt(event.timestamp))
+    });
+  }
+  
+  if (result.nextCursor) {
+    cursor = result.nextCursor;
+    await saveCursor(ANNOUNCEMENT_CURSOR_KEY, cursor);
+  }
+}
+```
+
+See `main.ts:167-192` for the full implementation.
+
+### Query Implementation
+
+The query endpoint (see `routes/announcements.ts:14-58`) supports:
+
+1. **Time-based filtering**: `since` parameter filters by timestamp
+2. **View tag filtering**: Optional `viewTag` parameter
+3. **Pagination**: Cursor-based pagination with configurable limit
+4. **Ordering**: Results ordered by timestamp (descending)
+
+### Database Schema
+
+```sql
+CREATE TABLE announcements (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ephemeral_pubkey TEXT NOT NULL,
+  view_tag INTEGER NOT NULL,
+  stealth_address TEXT NOT NULL,
+  metadata TEXT,
+  tx_digest TEXT NOT NULL,
+  timestamp TIMESTAMP NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_announcements_timestamp ON announcements(timestamp DESC);
+CREATE INDEX idx_announcements_view_tag ON announcements(view_tag);
+```
+
+### View Tags
+
+View tags are 8-bit values (0-255) that allow recipients to quickly filter announcements:
+
+- Sender computes: `viewTag = hash(recipientViewKey, ephemeralKey) % 256`
+- Recipient checks: Does this announcement match one of my view tags?
+- Privacy: Viewing all announcements is more private than filtering by specific tags
+
+## Wallet Scanning Flow
+
+### Privacy-Preserving Scan
+
+```typescript
+// 1. Fetch all recent announcements (privacy-preserving)
+const { announcements } = await fetch(
+  '/api/identipay/v1/announcements?since=2026-03-09T00:00:00Z&limit=1000'
+).then(r => r.json());
+
+// 2. Compute my view tags locally
+const myViewTags = computeMyViewTags(viewKey); // e.g., [42, 99, 156, ...]
+
+// 3. Filter announcements locally
+const candidates = announcements.filter(a => myViewTags.includes(a.viewTag));
+
+// 4. For each candidate, check if it's actually mine
+for (const announcement of candidates) {
+  const isMineStealth = checkStealthAddress(
+    announcement.stealthAddress,
+    announcement.ephemeralPubkey,
+    mySpendKey,
+    myViewKey
+  );
+  
+  if (isMine) {
+    // Found an incoming payment!
+    await processIncomingPayment(announcement);
+  }
+}
+```
+
+### Incremental Sync
+
+Wallets can sync incrementally using timestamps:
+
+```typescript
+// Load last sync time from local storage
+const lastSync = localStorage.getItem('lastAnnouncementSync') || '2026-01-01T00:00:00Z';
+
+// Fetch only new announcements
+const response = await fetch(
+  `/api/identipay/v1/announcements?since=${lastSync}&limit=1000`
+);
+const { announcements } = await response.json();
+
+// Process new announcements
+for (const announcement of announcements) {
+  await scanAnnouncement(announcement);
+}
+
+// Update sync timestamp
+localStorage.setItem('lastAnnouncementSync', new Date().toISOString());
+```
+
+## Privacy Best Practices
+
+<Check>
+  Always fetch all announcements and filter locally
+</Check>
+
+<Check>
+  Use the `since` parameter to sync only new announcements
+</Check>
+
+<Check>
+  Don't use the `viewTag` parameter unless absolutely necessary
+</Check>
+
+<Warning>
+  Filtering by view tag on the server reveals information about your wallet to the backend
+</Warning>
+
+## Related Endpoints
+
+- [Names](/api/names) - Resolve names to meta-addresses
+- [Transactions](/api/transactions) - Send stealth payments
+- [Pay Requests](/api/pay-requests) - Create payment requests

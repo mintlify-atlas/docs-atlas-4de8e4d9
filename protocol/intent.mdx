@@ -1,0 +1,355 @@
+---
+title: "Intent Contract"
+description: "Ed25519 signature verification for buyer intent authentication"
+---
+
+## Overview
+
+The Intent contract (`identipay::intent`) provides a simple but critical function: verifying that the buyer signed the canonicalized intent hash using Ed25519.
+
+This signature provides **semantic binding** of the buyer's intent to the transaction execution, as described in the whitepaper section 5.3. Unlike traditional credit card payments where merchants can initiate charges, identiPay requires explicit buyer authorization via cryptographic signature.
+
+## Source Code
+
+Location: `contracts/sources/intent.move:5`
+
+## How It Works
+
+<Steps>
+  <Step title="Proposal Creation">
+    Merchant creates a commerce proposal (amount, items, constraints) and sends to buyer's wallet.
+  </Step>
+  
+  <Step title="Canonicalization">
+    Buyer's wallet canonicalizes the proposal JSON-LD using URDNA2015 to ensure consistent byte representation.
+  </Step>
+  
+  <Step title="Hashing">
+    Wallet computes `intent_hash = SHA3-256(canonicalized_proposal)`.
+  </Step>
+  
+  <Step title="User Approval">
+    User reviews the proposal in the wallet UI and approves.
+  </Step>
+  
+  <Step title="Signature">
+    Wallet signs the intent hash using the user's Ed25519 private key: `signature = Sign(k_buyer, intent_hash)`.
+  </Step>
+  
+  <Step title="Settlement">
+    Settlement contract calls `verify_intent_signature()` to ensure the signature is valid before executing payment.
+  </Step>
+</Steps>
+
+## Data Structures
+
+This module has no custom data structures — it only performs signature verification.
+
+## Public Functions
+
+### verify_intent_signature
+
+Verify that a signature is valid for a given intent hash and public key. Aborts if invalid.
+
+**Function Signature:**
+
+```move
+public(package) fun verify_intent_signature(
+    intent_sig: &vector<u8>,
+    intent_hash: &vector<u8>,
+    public_key: &vector<u8>,
+)
+```
+
+<ParamField path="intent_sig" type="&vector<u8>" required>
+  Ed25519 signature (exactly 64 bytes)
+</ParamField>
+
+<ParamField path="intent_hash" type="&vector<u8>" required>
+  SHA3-256 hash of the canonicalized proposal (32 bytes)
+</ParamField>
+
+<ParamField path="public_key" type="&vector<u8>" required>
+  Buyer's Ed25519 public key (exactly 32 bytes)
+</ParamField>
+
+**Errors:**
+
+- `EInvalidSignatureLength` (1): Signature is not 64 bytes
+- `EInvalidPublicKeyLength` (2): Public key is not 32 bytes
+- `EEmptyIntentHash` (3): Intent hash is empty
+- `EInvalidSignature` (0): Signature verification failed
+
+**Visibility:** `public(package)` — only callable by other modules in the `identipay` package (primarily `settlement`).
+
+**Location:** `intent.move:26-37`
+
+## Usage Example
+
+<CodeGroup>
+
+```typescript Wallet: Intent Signing
+import { canonicalize } from 'json-canonicalize';
+import { sha3_256 } from '@noble/hashes/sha3';
+import { ed25519 } from '@noble/curves/ed25519';
+
+// Merchant's proposal
+const proposal = {
+  '@context': 'https://schema.org',
+  '@type': 'Invoice',
+  merchant: 'did:identipay:shop.example.com:merchant123',
+  amount: '100.00',
+  currency: 'USDC',
+  items: [
+    {
+      '@type': 'Product',
+      name: 'Coffee',
+      price: '5.00',
+    },
+  ],
+  expiry: '2026-03-09T12:00:00Z',
+  constraints: {
+    minAge: 18,
+  },
+};
+
+// 1. Canonicalize using URDNA2015 (for JSON-LD)
+const canonicalized = canonicalize(proposal);
+
+// 2. Hash with SHA3-256
+const intentHash = sha3_256(canonicalized);
+
+// 3. Display to user for approval
+showApprovalDialog(proposal);
+
+// 4. User approves, sign with Ed25519
+const signature = ed25519.sign(intentHash, buyerPrivateKey);
+
+// 5. Submit to settlement
+await executeSettlement({
+  intentHash: Array.from(intentHash),
+  intentSig: Array.from(signature),
+  buyerPubkey: Array.from(ed25519.getPublicKey(buyerPrivateKey)),
+  // ... other params
+});
+```
+
+```move Settlement Contract
+use identipay::intent;
+
+entry fun execute_commerce<T>(
+    // ... other params
+    intent_sig: vector<u8>,
+    intent_hash: vector<u8>,
+    buyer_pubkey: vector<u8>,
+    // ...
+) {
+    // Verify intent signature (aborts if invalid)
+    intent::verify_intent_signature(
+        &intent_sig,
+        &intent_hash,
+        &buyer_pubkey
+    );
+    
+    // Proceed with payment transfer...
+}
+```
+
+```typescript Testing
+import { ed25519 } from '@noble/curves/ed25519';
+import { sha3_256 } from '@noble/hashes/sha3';
+
+// Generate test keypair
+const privateKey = ed25519.utils.randomPrivateKey();
+const publicKey = ed25519.getPublicKey(privateKey);
+
+// Create test intent hash
+const proposal = { amount: 100, merchant: '0x123' };
+const intentHash = sha3_256(JSON.stringify(proposal));
+
+// Sign
+const signature = ed25519.sign(intentHash, privateKey);
+
+// Verify off-chain (should match on-chain behavior)
+const valid = ed25519.verify(signature, intentHash, publicKey);
+assert(valid === true);
+
+// Test on-chain
+const tx = new TransactionBlock();
+tx.moveCall({
+  target: `${PACKAGE_ID}::intent::test_verify_intent_signature`,
+  arguments: [
+    tx.pure(Array.from(signature)),
+    tx.pure(Array.from(intentHash)),
+    tx.pure(Array.from(publicKey)),
+  ],
+});
+
+// Should succeed
+await client.devInspectTransactionBlock({ transactionBlock: tx });
+```
+
+</CodeGroup>
+
+## Intent Hash Computation
+
+The intent hash is the **SHA3-256** hash of the **URDNA2015-canonicalized** JSON-LD proposal.
+
+### Why URDNA2015?
+
+JSON has many equivalent representations:
+```json
+{"amount": 100, "merchant": "0x123"}
+{"merchant":"0x123","amount":100}
+{ "amount" : 100 , "merchant" : "0x123" }
+```
+
+All are semantically identical but have different byte representations. Without canonicalization, the hash would differ.
+
+**URDNA2015** (RDF Dataset Normalization) ensures:
+- Consistent key ordering
+- Consistent whitespace
+- Consistent Unicode normalization
+- Canonical representation of JSON-LD semantics
+
+### Why SHA3-256?
+
+SHA3-256 (Keccak) is used instead of SHA2-256 because:
+- **Different construction**: Sponge construction vs. Merkle-Damgård
+- **Length extension resistance**: SHA3 is inherently resistant
+- **Modern standard**: NIST standardized in 2015
+- **Sui native**: Sui Move has built-in SHA3 support
+
+## Security Properties
+
+<AccordionGroup>
+  <Accordion title="Non-Repudiation" icon="file-contract">
+    Once a buyer signs an intent, they cannot deny having authorized the payment. The signature is cryptographic proof of authorization.
+  </Accordion>
+  
+  <Accordion title="Semantic Binding" icon="link">
+    The signature binds to the **semantic content** of the proposal (amount, items, merchant), not just a generic "approve" message. This prevents bait-and-switch attacks.
+  </Accordion>
+  
+  <Accordion title="Replay Protection" icon="shield">
+    The settlement contract tracks executed intent hashes to prevent replay. Even with a valid signature, the same intent cannot be executed twice.
+  </Accordion>
+  
+  <Accordion title="Expiry Enforcement" icon="clock">
+    Proposals include expiry timestamps. The settlement contract rejects expired proposals even if the signature is valid.
+  </Accordion>
+</AccordionGroup>
+
+## Attack Prevention
+
+### Bait-and-Switch Attack
+
+**Attack**: Merchant shows user a proposal for $10, but submits a different proposal for $1000.
+
+**Prevention**: User's wallet computes the hash of the displayed proposal and signs it. The on-chain signature verification ensures only the exact proposal that was signed can execute.
+
+### Replay Attack
+
+**Attack**: Merchant captures a valid signature and submits the same intent multiple times.
+
+**Prevention**: Settlement contract maintains a table of executed intent hashes (`SettlementState.executed_intents`). Second execution aborts with `EIntentAlreadyExecuted`.
+
+### Phishing Attack
+
+**Attack**: Attacker tricks user into signing a malicious proposal.
+
+**Prevention**: Wallet UI must display proposal details clearly before requesting signature. Users should verify merchant identity via Trust Registry.
+
+### Man-in-the-Middle Attack
+
+**Attack**: Attacker intercepts proposal and modifies it before user signs.
+
+**Prevention**: Proposals should be transmitted over secure channels (HTTPS, WebSocket over TLS). Merchant DID provides authentication.
+
+## Comparison to Traditional Payments
+
+| Feature | Credit Cards | identiPay Intents |
+|---------|--------------|-------------------|
+| Authorization | Merchant-initiated (pull) | Buyer-initiated (push) |
+| Binding | Generic card number | Cryptographic signature on specific proposal |
+| Replay Protection | Limited (CVV, expiry) | Cryptographic (hash tracking) |
+| Non-Repudiation | Weak (can dispute) | Strong (unforgeable signature) |
+| Privacy | Reusable credentials | One-time stealth addresses |
+| Fraud Risk | High (credential theft) | Low (no reusable credentials) |
+
+## Edge Cases
+
+<AccordionGroup>
+  <Accordion title="Empty Intent Hash" icon="question">
+    Aborts with `EEmptyIntentHash`. This prevents accidental signing of null data.
+  </Accordion>
+  
+  <Accordion title="Wrong Key" icon="key">
+    If the signature was created with a different private key than the provided public key, verification fails with `EInvalidSignature`.
+  </Accordion>
+  
+  <Accordion title="Modified Hash" icon="edit">
+    If the intent hash is modified after signing, verification fails with `EInvalidSignature`.
+  </Accordion>
+  
+  <Accordion title="Modified Signature" icon="eraser">
+    Even a single bit flip in the signature causes verification to fail with `EInvalidSignature`.
+  </Accordion>
+</AccordionGroup>
+
+## Implementation Notes
+
+### Ed25519 Choice
+
+identiPay uses **Ed25519** (not ECDSA secp256k1) because:
+- **Deterministic**: No nonce generation, eliminates nonce-reuse attacks
+- **Fast**: ~2x faster than ECDSA for signing
+- **Small signatures**: 64 bytes (vs. 65-73 for ECDSA)
+- **Sui native**: Sui Move has built-in `sui::ed25519::ed25519_verify()`
+
+### Sui Native Verification
+
+The contract uses Sui's native `ed25519_verify()` function:
+
+```move
+use sui::ed25519;
+
+let valid = ed25519::ed25519_verify(
+    signature,    // 64 bytes
+    public_key,   // 32 bytes
+    message,      // arbitrary length
+);
+```
+
+This is implemented in Sui's Move VM as a native function, making it very efficient (constant gas cost, fast execution).
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Display Before Sign" icon="eye">
+    Wallet UIs must display the full proposal details (amount, merchant name, items) before requesting the user's signature. Never auto-sign.
+  </Accordion>
+  
+  <Accordion title="Verify Merchant" icon="certificate">
+    Before showing the approval dialog, verify the merchant is registered in the Trust Registry and active.
+  </Accordion>
+  
+  <Accordion title="Check Expiry" icon="clock">
+    Validate that `proposal.expiry > current_time` before signing. Don't sign expired proposals.
+  </Accordion>
+  
+  <Accordion title="Secure Key Storage" icon="vault">
+    Store Ed25519 private keys in secure enclaves (iOS Secure Enclave, Android Keystore, hardware wallets).
+  </Accordion>
+</AccordionGroup>
+
+## Related Modules
+
+<CardGroup cols={2}>
+  <Card title="Settlement" icon="hand-holding-dollar" href="/protocol/settlement">
+    Calls verify_intent_signature during execution
+  </Card>
+  <Card title="Trust Registry" icon="certificate" href="/protocol/trust-registry">
+    Verify merchant legitimacy before signing
+  </Card>
+</CardGroup>

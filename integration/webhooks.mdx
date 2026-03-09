@@ -1,0 +1,613 @@
+---
+title: WebSocket API
+description: Real-time payment status updates via WebSocket connection
+---
+
+## Overview
+
+The identiPay WebSocket API provides real-time notifications when payment settlements occur. This allows your frontend to immediately update the UI when a customer completes payment.
+
+<Info>
+WebSocket connections do not require API key authentication. The transaction ID itself serves as authorization since it's randomly generated and unguessable.
+</Info>
+
+## Connection URL
+
+```
+ws://api.identipay.net/ws/transactions/{transactionId}
+wss://api.identipay.net/ws/transactions/{transactionId}
+```
+
+- Use `ws://` for development (HTTP)
+- Use `wss://` for production (HTTPS)
+
+## Connecting to WebSocket
+
+### Browser JavaScript
+
+```javascript
+const transactionId = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+
+const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+const wsUrl = `${protocol}//api.identipay.net/ws/transactions/${transactionId}`;
+
+const ws = new WebSocket(wsUrl);
+
+ws.onopen = () => {
+  console.log("Connected to payment status updates");
+};
+
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log("Received:", data);
+  
+  if (data.type === "settlement") {
+    // Payment completed!
+    showSuccessMessage(data.suiTxDigest);
+  }
+};
+
+ws.onerror = (error) => {
+  console.error("WebSocket error:", error);
+};
+
+ws.onclose = () => {
+  console.log("WebSocket connection closed");
+};
+
+// Clean up when done
+function cleanup() {
+  ws.close();
+}
+```
+
+### React Hook
+
+From the checkout demo (`checkout-demo/src/components/CheckoutPage.tsx:97-129`):
+
+```typescript
+import { useState, useEffect } from "react";
+
+interface ProposalData {
+  transactionId: string;
+  intentHash: string;
+  uri: string;
+  expiresAt: string;
+}
+
+export default function CheckoutPage() {
+  const [step, setStep] = useState<"pay" | "confirming" | "success">("pay");
+  const [proposal, setProposal] = useState<ProposalData | null>(null);
+  const [txHash, setTxHash] = useState("");
+
+  // WebSocket listener for real-time settlement updates
+  useEffect(() => {
+    if (step !== "pay" || !proposal?.transactionId) return;
+
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const backendHost = process.env.NEXT_PUBLIC_BACKEND_URL
+      ? new URL(process.env.NEXT_PUBLIC_BACKEND_URL).host
+      : "localhost:8000";
+    const wsUrl = `${protocol}//${backendHost}/ws/transactions/${proposal.transactionId}`;
+    const ws = new WebSocket(wsUrl);
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === "settlement" || 
+            (data.type === "status" && data.status === "settled")) {
+          setStep("confirming");
+          setTxHash(data.suiTxDigest || "");
+          // Brief confirming animation, then success
+          setTimeout(() => setStep("success"), 2000);
+        }
+      } catch {
+        // ignore parse errors
+      }
+    };
+
+    ws.onerror = (err) => {
+      console.error("WebSocket error:", err);
+    };
+
+    return () => {
+      ws.close();
+    };
+  }, [step, proposal?.transactionId]);
+
+  return (
+    <div>
+      {step === "pay" && <PaymentQRCode proposal={proposal} />}
+      {step === "confirming" && <ConfirmingAnimation />}
+      {step === "success" && <SuccessMessage txHash={txHash} />}
+    </div>
+  );
+}
+```
+
+### Node.js
+
+```javascript
+const WebSocket = require('ws');
+
+const transactionId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+const ws = new WebSocket(
+  `wss://api.identipay.net/ws/transactions/${transactionId}`
+);
+
+ws.on('open', () => {
+  console.log('Connected');
+});
+
+ws.on('message', (data) => {
+  const message = JSON.parse(data.toString());
+  console.log('Received:', message);
+  
+  if (message.type === 'settlement') {
+    console.log(`Payment settled! Tx: ${message.suiTxDigest}`);
+    ws.close();
+  }
+});
+
+ws.on('error', (error) => {
+  console.error('Error:', error);
+});
+```
+
+## Message Types
+
+### Status Message
+
+Sent immediately upon connection with current proposal status.
+
+```json
+{
+  "type": "status",
+  "transactionId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "status": "pending",
+  "suiTxDigest": null
+}
+```
+
+<ParamField body="type" type="string">
+  Always `"status"`
+</ParamField>
+
+<ParamField body="transactionId" type="string">
+  UUID of the transaction
+</ParamField>
+
+<ParamField body="status" type="string">
+  Current proposal status: `pending`, `settled`, `expired`, or `cancelled`
+</ParamField>
+
+<ParamField body="suiTxDigest" type="string | null">
+  Sui blockchain transaction digest (only present if settled)
+</ParamField>
+
+### Settlement Message
+
+Sent when payment is successfully settled on-chain.
+
+```json
+{
+  "type": "settlement",
+  "transactionId": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "status": "settled",
+  "suiTxDigest": "8x7HKvUKRhXZ9Q2bNnF4kP3mT6wJ1sY5vL2cD9gE4aB6"
+}
+```
+
+<ParamField body="type" type="string">
+  Always `"settlement"`
+</ParamField>
+
+<ParamField body="transactionId" type="string">
+  UUID of the transaction
+</ParamField>
+
+<ParamField body="status" type="string">
+  Always `"settled"`
+</ParamField>
+
+<ParamField body="suiTxDigest" type="string">
+  Sui blockchain transaction digest for verification
+  
+  You can view the transaction at:
+  `https://suiscan.xyz/mainnet/tx/{suiTxDigest}`
+</ParamField>
+
+<Note>
+**Privacy Note**: The settlement message does NOT include the buyer's stealth address or any identifying information. You only receive confirmation that payment was received.
+</Note>
+
+### Error Message
+
+Sent if transaction is not found or has been deleted.
+
+```json
+{
+  "type": "error",
+  "message": "Transaction not found"
+}
+```
+
+<ParamField body="type" type="string">
+  Always `"error"`
+</ParamField>
+
+<ParamField body="message" type="string">
+  Human-readable error description
+</ParamField>
+
+## Backend Implementation
+
+Here's how the WebSocket handler works on the backend:
+
+### Connection Handler
+
+From `backend/src/ws/status.ts:14-42`:
+
+```typescript
+interface WsConnection {
+  send(data: string): void;
+  close(): void;
+}
+
+// Map of transactionId -> set of WebSocket connections
+const connections = new Map<string, Set<WsConnection>>();
+
+export function handleWsConnection(
+  txId: string,
+  ws: WsConnection,
+  db: Db,
+  onCleanup?: () => void,
+) {
+  if (!connections.has(txId)) {
+    connections.set(txId, new Set());
+  }
+  connections.get(txId)!.add(ws);
+
+  // Send current status on connect
+  sendCurrentStatus(txId, ws, db);
+
+  // Return cleanup function
+  return () => {
+    const set = connections.get(txId);
+    if (set) {
+      set.delete(ws);
+      if (set.size === 0) {
+        connections.delete(txId);
+      }
+    }
+    onCleanup?.();
+  };
+}
+```
+
+### Current Status Retrieval
+
+From `backend/src/ws/status.ts:44-75`:
+
+```typescript
+async function sendCurrentStatus(txId: string, ws: WsConnection, db: Db) {
+  try {
+    const [proposal] = await db
+      .select()
+      .from(proposals)
+      .where(eq(proposals.transactionId, txId))
+      .limit(1);
+
+    if (proposal) {
+      ws.send(
+        JSON.stringify({
+          type: "status",
+          transactionId: proposal.transactionId,
+          status: proposal.status,
+          suiTxDigest: proposal.suiTxDigest,
+        }),
+      );
+    } else {
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          message: "Transaction not found",
+        }),
+      );
+    }
+  } catch (error) {
+    console.error("Failed to send status:", error);
+  }
+}
+```
+
+### Broadcasting Settlement
+
+From `backend/src/ws/status.ts:77-103`:
+
+```typescript
+export function pushSettlementUpdate(
+  txId: string,
+  status: string,
+  suiTxDigest: string,
+) {
+  const set = connections.get(txId);
+  if (!set) return;
+
+  const message = JSON.stringify({
+    type: "settlement",
+    transactionId: txId,
+    status,
+    suiTxDigest,
+  });
+
+  for (const ws of set) {
+    try {
+      ws.send(message);
+    } catch {
+      set.delete(ws);
+    }
+  }
+}
+```
+
+This function is called when the backend detects a `StealthAnnouncement` event on the Sui blockchain.
+
+## Connection Lifecycle
+
+<Steps>
+  <Step title="Client Connects">
+    Frontend establishes WebSocket connection with transaction ID
+  </Step>
+  
+  <Step title="Initial Status">
+    Backend sends current proposal status (usually `pending`)
+  </Step>
+  
+  <Step title="Wait for Settlement">
+    Connection remains open, waiting for blockchain confirmation
+  </Step>
+  
+  <Step title="Settlement Event">
+    Backend detects on-chain settlement and broadcasts to all connected clients
+  </Step>
+  
+  <Step title="Client Disconnects">
+    Frontend closes connection after showing success message
+  </Step>
+</Steps>
+
+## Connection Limits
+
+- **Maximum concurrent connections**: 50 per merchant
+- **Connection timeout**: 30 minutes of inactivity
+- **Message rate limit**: Not applicable (server-sent only)
+
+If you exceed concurrent connection limits, new connections will receive an error and be closed.
+
+## Error Handling
+
+### Connection Errors
+
+```typescript
+const ws = new WebSocket(wsUrl);
+
+ws.onerror = (error) => {
+  console.error("WebSocket error:", error);
+  // Show fallback UI
+  showPollingFallback();
+};
+
+ws.onclose = (event) => {
+  if (!event.wasClean) {
+    console.error(`Connection closed unexpectedly: ${event.reason}`);
+    // Attempt reconnect
+    setTimeout(() => reconnect(), 5000);
+  }
+};
+```
+
+### Reconnection Strategy
+
+```typescript
+function connectWithRetry(transactionId, maxRetries = 3) {
+  let retries = 0;
+  
+  function connect() {
+    const ws = new WebSocket(
+      `wss://api.identipay.net/ws/transactions/${transactionId}`
+    );
+    
+    ws.onerror = () => {
+      if (retries < maxRetries) {
+        retries++;
+        const delay = Math.min(1000 * Math.pow(2, retries), 10000);
+        console.log(`Retrying in ${delay}ms...`);
+        setTimeout(connect, delay);
+      } else {
+        console.error("Max retries reached, falling back to polling");
+        startPolling(transactionId);
+      }
+    };
+    
+    ws.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      handleMessage(data);
+    };
+    
+    return ws;
+  }
+  
+  return connect();
+}
+```
+
+### Fallback to Polling
+
+If WebSocket is unavailable, poll the status endpoint:
+
+```typescript
+function startPolling(transactionId) {
+  const interval = setInterval(async () => {
+    const response = await fetch(
+      `https://api.identipay.net/api/identipay/v1/transactions/${transactionId}/status`,
+      {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+      }
+    );
+    
+    const data = await response.json();
+    
+    if (data.status === "settled") {
+      clearInterval(interval);
+      showSuccessMessage(data.suiTxDigest);
+    } else if (data.status === "expired" || data.status === "cancelled") {
+      clearInterval(interval);
+      showErrorMessage(data.status);
+    }
+  }, 3000); // Poll every 3 seconds
+  
+  return interval;
+}
+```
+
+## Security Considerations
+
+### Transaction ID as Authorization
+
+The transaction ID (UUID v4) provides sufficient entropy:
+
+- **122 bits of randomness**
+- **2^122 possible values** (~5.3 × 10^36)
+- **Impossible to guess** or brute force
+
+This is why WebSocket connections don't require additional authentication.
+
+<Warning>
+Do not log or expose transaction IDs in public locations (analytics, error tracking, etc.). Treat them as sensitive identifiers.
+</Warning>
+
+### What Merchants Can See
+
+Merchants receive:
+- Transaction ID
+- Settlement status
+- Sui transaction digest
+
+Merchants **cannot** see:
+- Buyer's identity or address
+- Buyer's stealth address
+- Receipt contents
+- Any personally identifiable information
+
+### What Buyers Receive
+
+Buyers receive encrypted receipts via stealth address announcements on-chain. The merchant's WebSocket does not receive or relay any buyer information.
+
+## Testing
+
+Test WebSocket connections:
+
+### Using Browser DevTools
+
+1. Open browser DevTools (F12)
+2. Go to Console tab
+3. Run:
+
+```javascript
+const ws = new WebSocket(
+  'wss://api.identipay.net/ws/transactions/f47ac10b-58cc-4372-a567-0e02b2c3d479'
+);
+
+ws.onmessage = (e) => console.log('Received:', JSON.parse(e.data));
+```
+
+4. You should see the initial status message
+
+### Using wscat
+
+```bash
+npm install -g wscat
+
+wscat -c wss://api.identipay.net/ws/transactions/f47ac10b-58cc-4372-a567-0e02b2c3d479
+```
+
+### Simulating Settlement (Sandbox)
+
+In sandbox mode, you can trigger a test settlement:
+
+```bash
+curl -X POST https://sandbox.identipay.net/api/test/settle \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transactionId": "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+  }'
+```
+
+This will immediately send a settlement message to all connected WebSocket clients.
+
+## Monitoring
+
+Track WebSocket connection health:
+
+```typescript
+const activeConnections = new Map();
+
+function monitorConnection(transactionId, ws) {
+  const startTime = Date.now();
+  
+  activeConnections.set(transactionId, {
+    startTime,
+    status: 'connected',
+  });
+  
+  ws.onclose = () => {
+    const duration = Date.now() - startTime;
+    console.log(`Connection closed after ${duration}ms`);
+    activeConnections.delete(transactionId);
+  };
+  
+  // Heartbeat
+  const heartbeat = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'ping' }));
+    } else {
+      clearInterval(heartbeat);
+    }
+  }, 30000);
+}
+```
+
+## Alternative: Server-Sent Events (SSE)
+
+If you prefer HTTP-based streaming:
+
+```javascript
+const eventSource = new EventSource(
+  `https://api.identipay.net/sse/transactions/${transactionId}`
+);
+
+eventSource.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log('Received:', data);
+};
+
+eventSource.onerror = () => {
+  console.error('SSE connection error');
+  eventSource.close();
+};
+```
+
+<Note>
+SSE is currently not implemented but may be added in future versions. Use WebSocket for now.
+</Note>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Payment Flow" icon="arrow-right-arrow-left" href="/integration/payment-flow">
+    Understand complete payment lifecycle
+  </Card>
+</CardGroup>

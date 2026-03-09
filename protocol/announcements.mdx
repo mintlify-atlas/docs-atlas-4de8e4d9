@@ -1,0 +1,426 @@
+---
+title: "Announcements Contract"
+description: "Stealth payment announcement events for privacy-preserving payment detection"
+---
+
+## Overview
+
+The Announcements contract (`identipay::announcements`) provides a simple but critical function: emitting events that allow recipients to detect stealth payments without scanning the entire blockchain.
+
+When a sender pays to a one-time stealth address, they emit an announcement containing:
+- Ephemeral public key `R`
+- View tag (1-byte filter)
+- Stealth address
+- Optional metadata
+
+Recipients scan these announcements to detect incoming payments, as described in the whitepaper section 4.4.
+
+## Source Code
+
+Location: `contracts/sources/announcements.move:6`
+
+## How It Works
+
+<Steps>
+  <Step title="Payment Derivation">
+    Sender derives a one-time stealth address `P` using recipient's meta-address and ephemeral key `r`.
+  </Step>
+  
+  <Step title="Payment Send">
+    Sender transfers tokens to the stealth address `P`.
+  </Step>
+  
+  <Step title="Announcement Emission">
+    Sender calls `announce()` with ephemeral public key `R = r*G`, view tag, and stealth address.
+  </Step>
+  
+  <Step title="Event Indexing">
+    Off-chain indexers capture the StealthAnnouncement event.
+  </Step>
+  
+  <Step title="Recipient Scanning">
+    Recipient's wallet scans announcements, filtering by view tag, then checking full ECDH computation.
+  </Step>
+  
+  <Step title="Payment Detection">
+    If the computed address matches, recipient derives the private key and can spend the funds.
+  </Step>
+</Steps>
+
+## Data Structures
+
+### StealthAnnouncement
+
+Event emitted when a payment is sent to a stealth address.
+
+<ResponseField name="ephemeral_pubkey" type="vector<u8>">
+  Ephemeral public key `R = r*G` (32 bytes). Recipients use this with their viewing private key to derive the shared secret and detect payments.
+</ResponseField>
+
+<ResponseField name="view_tag" type="u8">
+  First byte of the ECDH shared secret. Fast 1-byte filter reduces full ECDH computations by ~256x during scanning.
+</ResponseField>
+
+<ResponseField name="stealth_address" type="address">
+  The derived one-time stealth address where the payment was sent.
+</ResponseField>
+
+<ResponseField name="metadata" type="vector<u8>">
+  Optional encrypted memo (e.g., payment reason, sender hint). Can be empty.
+</ResponseField>
+
+```move
+public struct StealthAnnouncement has copy, drop {
+    ephemeral_pubkey: vector<u8>,
+    view_tag: u8,
+    stealth_address: address,
+    metadata: vector<u8>,
+}
+```
+
+## Entry Functions
+
+### announce
+
+Emit a stealth payment announcement. Called by anyone sending to a stealth address.
+
+**Function Signature:**
+
+```move
+entry fun announce(
+    ephemeral_pubkey: vector<u8>,
+    view_tag: u8,
+    stealth_address: address,
+    metadata: vector<u8>,
+    _ctx: &mut TxContext,
+)
+```
+
+<ParamField path="ephemeral_pubkey" type="vector<u8>" required>
+  Ephemeral public key (exactly 32 bytes)
+</ParamField>
+
+<ParamField path="view_tag" type="u8" required>
+  First byte of ECDH shared secret for fast filtering
+</ParamField>
+
+<ParamField path="stealth_address" type="address" required>
+  Derived one-time stealth address
+</ParamField>
+
+<ParamField path="metadata" type="vector<u8>">
+  Optional encrypted metadata. Pass empty vector if no metadata.
+</ParamField>
+
+**Errors:**
+
+- `EInvalidEphemeralPubkey` (0): Ephemeral pubkey is not 32 bytes
+
+**Location:** `announcements.move:38-53`
+
+## Usage Example
+
+<CodeGroup>
+
+```typescript TypeScript SDK
+import { TransactionBlock } from '@mysten/sui.js/transactions';
+import { deriveStealthAddress, deriveECDH } from '@identipay/crypto';
+
+// Resolve recipient's meta-address
+const [spendPubkey, viewPubkey] = await identiPayClient.resolveName(
+  recipientName
+);
+
+// Generate ephemeral keypair
+const ephemeralPrivateKey = randomBytes(32);
+const ephemeralPubkey = derivePublicKey(ephemeralPrivateKey);
+
+// Derive stealth address
+const stealthAddress = deriveStealthAddress(
+  spendPubkey,
+  viewPubkey,
+  ephemeralPrivateKey
+);
+
+// Compute view tag (first byte of shared secret)
+const sharedSecret = deriveECDH(ephemeralPrivateKey, viewPubkey);
+const viewTag = sharedSecret[0];
+
+// Optional: encrypt metadata
+const metadata = encryptMetadata(
+  { memo: 'Coffee payment', sender: '@alice' },
+  sharedSecret
+);
+
+// Build transaction: transfer + announce
+const tx = new TransactionBlock();
+
+// 1. Transfer tokens to stealth address
+const [coin] = tx.splitCoins(tx.gas, [tx.pure(amount)]);
+tx.transferObjects([coin], tx.pure(stealthAddress));
+
+// 2. Emit announcement
+tx.moveCall({
+  target: `${PACKAGE_ID}::announcements::announce`,
+  arguments: [
+    tx.pure(Array.from(ephemeralPubkey)),
+    tx.pure(viewTag),
+    tx.pure(stealthAddress),
+    tx.pure(Array.from(metadata)),
+  ],
+});
+
+await wallet.signAndExecuteTransactionBlock({ transactionBlock: tx });
+```
+
+```typescript Recipient Scanning
+import { identiPayIndexer } from '@identipay/sdk';
+import { deriveECDH, deriveStealthAddress } from '@identipay/crypto';
+
+// Subscribe to stealth announcements
+const subscription = identiPayIndexer.subscribeToAnnouncements(
+  async (announcement) => {
+    const { ephemeralPubkey, viewTag, stealthAddress, metadata } =
+      announcement;
+
+    // Fast filter: check view tag
+    const sharedSecret = deriveECDH(myViewPrivateKey, ephemeralPubkey);
+    if (sharedSecret[0] !== viewTag) {
+      return; // Not for me
+    }
+
+    // Full check: derive expected stealth address
+    const expectedAddress = deriveStealthAddress(
+      mySpendPubkey,
+      myViewPubkey,
+      ephemeralToPrivate(ephemeralPubkey, myViewPrivateKey)
+    );
+
+    if (expectedAddress === stealthAddress) {
+      // This payment is for me!
+      const stealthPrivateKey = deriveStealthPrivateKey(
+        mySpendPrivateKey,
+        sharedSecret
+      );
+
+      // Decrypt metadata if present
+      const decryptedMetadata = metadata.length
+        ? decryptMetadata(metadata, sharedSecret)
+        : null;
+
+      // Store for wallet UI
+      await saveIncomingPayment({
+        address: stealthAddress,
+        privateKey: stealthPrivateKey,
+        metadata: decryptedMetadata,
+        timestamp: announcement.timestamp,
+      });
+
+      console.log('Detected incoming payment:', stealthAddress);
+    }
+  }
+);
+```
+
+```move Move (in PTB context)
+// Example: Settlement contract emits announcement after minting receipt
+use identipay::announcements;
+
+// After transferring receipt to buyer_stealth_addr...
+announcements::announce(
+    ephemeral_pubkey,
+    view_tag,
+    buyer_stealth_addr,
+    vector[], // no metadata in settlement flow
+    ctx,
+);
+```
+
+</CodeGroup>
+
+## View Tag Optimization
+
+The **view tag** is a critical optimization that reduces scanning costs by ~256x.
+
+### Without View Tag
+
+Recipients must:
+1. For each announcement, compute full ECDH: `S = k_view * R`
+2. Derive stealth address: `P = K_spend + Hash(S)*G`
+3. Compare with announcement's `stealth_address`
+
+For 1,000 announcements/day, this requires **1,000 ECDH computations** (expensive).
+
+### With View Tag
+
+Recipients:
+1. For each announcement, check `view_tag == S[0]` (cheap byte comparison)
+2. Only if match, compute full ECDH and derive address
+
+For 1,000 announcements/day with 1% match rate, this requires:
+- **1,000 byte comparisons** (very cheap)
+- **~4 ECDH computations** (256x fewer)
+
+This makes mobile wallet scanning practical.
+
+## Event Indexing
+
+Announcements are indexed off-chain for efficient querying:
+
+<CodeGroup>
+
+```typescript Indexer Setup
+import { SuiEventFilter } from '@mysten/sui.js/client';
+
+const filter: SuiEventFilter = {
+  MoveEventType: `${PACKAGE_ID}::announcements::StealthAnnouncement`,
+};
+
+// Subscribe to events
+const unsubscribe = await suiClient.subscribeEvent({
+  filter,
+  onMessage: (event) => {
+    const announcement = event.parsedJson;
+    processAnnouncement(announcement);
+  },
+});
+```
+
+```sql Database Schema
+CREATE TABLE stealth_announcements (
+  id SERIAL PRIMARY KEY,
+  ephemeral_pubkey BYTEA NOT NULL,
+  view_tag SMALLINT NOT NULL,
+  stealth_address TEXT NOT NULL,
+  metadata BYTEA,
+  tx_digest TEXT NOT NULL,
+  timestamp BIGINT NOT NULL,
+  INDEX idx_view_tag (view_tag),
+  INDEX idx_timestamp (timestamp DESC)
+);
+```
+
+```typescript Query API
+// Query announcements by view tag
+const announcements = await indexer.getAnnouncementsByViewTag({
+  viewTag: 0x42,
+  since: lastScanTimestamp,
+  limit: 100,
+});
+
+// Process batch
+for (const announcement of announcements) {
+  await checkIfForMe(announcement);
+}
+```
+
+</CodeGroup>
+
+## Privacy Considerations
+
+<AccordionGroup>
+  <Accordion title="Address Unlinkability" icon="unlink">
+    Announcements reveal stealth addresses but not recipient identities. Observers cannot link multiple stealth addresses to the same recipient.
+  </Accordion>
+  
+  <Accordion title="Metadata Encryption" icon="lock">
+    Optional metadata should be encrypted using the ECDH shared secret. Only the sender and recipient can decrypt it.
+  </Accordion>
+  
+  <Accordion title="View Tag Leakage" icon="eye">
+    The view tag leaks 8 bits of the shared secret. This is acceptable as the full shared secret is 256 bits, leaving 248 bits of entropy.
+  </Accordion>
+  
+  <Accordion title="Sender Privacy" icon="user-secret">
+    Announcements do not identify the sender. If sender privacy is needed, send from a stealth address and encrypt sender info in metadata.
+  </Accordion>
+</AccordionGroup>
+
+## Integration Patterns
+
+### Pattern 1: Settlement Module
+
+The Settlement contract does **not** emit announcements directly. Instead, the buyer's wallet emits the announcement as part of the PTB:
+
+```typescript
+const tx = new TransactionBlock();
+
+// 1. Execute settlement (transfers receipt to stealth address)
+tx.moveCall({
+  target: `${PACKAGE_ID}::settlement::execute_commerce`,
+  arguments: [/* ... */],
+});
+
+// 2. Emit announcement for receipt detection
+tx.moveCall({
+  target: `${PACKAGE_ID}::announcements::announce`,
+  arguments: [
+    tx.pure(ephemeralPubkey),
+    tx.pure(viewTag),
+    tx.pure(buyerStealthAddress),
+    tx.pure([]),
+  ],
+});
+```
+
+### Pattern 2: P2P Transfer
+
+Direct stealth payments between users:
+
+```typescript
+const tx = new TransactionBlock();
+
+// 1. Transfer tokens
+const [coin] = tx.splitCoins(tx.gas, [tx.pure(amount)]);
+tx.transferObjects([coin], tx.pure(stealthAddress));
+
+// 2. Announce
+tx.moveCall({
+  target: `${PACKAGE_ID}::announcements::announce`,
+  arguments: [
+    tx.pure(ephemeralPubkey),
+    tx.pure(viewTag),
+    tx.pure(stealthAddress),
+    tx.pure(encryptedMemo),
+  ],
+});
+```
+
+### Pattern 3: Shielded Pool Withdrawal
+
+No announcement needed for pool withdrawals since the recipient address is chosen by the user:
+
+```typescript
+// User chooses their own withdrawal address (typically a fresh stealth)
+await shieldedPool.withdraw({
+  recipient: myFreshStealthAddress,
+  // ...
+});
+
+// No announcement - user already knows about their own withdrawal
+```
+
+## Security Considerations
+
+<Warning>
+  **Timing Analysis**: Announcements are emitted in the same transaction as the payment. This links the payment to the announcement timing-wise. For maximum privacy, batch multiple payments in one transaction.
+</Warning>
+
+<Note>
+  **Event Reliability**: Sui guarantees event emission if the transaction succeeds. Failed transactions do not emit events, ensuring announcements always correspond to real payments.
+</Note>
+
+<Info>
+  **Gas Costs**: Emitting an announcement costs ~1,000 gas units. This is negligible compared to the overall transaction cost.
+</Info>
+
+## Related Modules
+
+<CardGroup cols={2}>
+  <Card title="Meta-Address Registry" icon="address-book" href="/protocol/meta-address-registry">
+    Resolve names to public keys for stealth derivation
+  </Card>
+  <Card title="Settlement" icon="hand-holding-dollar" href="/protocol/settlement">
+    Uses stealth addresses for receipt delivery
+  </Card>
+</CardGroup>

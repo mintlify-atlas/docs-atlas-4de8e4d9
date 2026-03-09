@@ -1,0 +1,641 @@
+---
+title: "Architecture Overview"
+description: "Deep dive into identiPay's multi-layer privacy-preserving payment architecture"
+---
+
+## System Architecture
+
+identiPay is a full-stack privacy protocol combining blockchain smart contracts, zero-knowledge circuits, backend indexers, and mobile applications. The architecture ensures that transactions are anonymous on-chain while still enabling verifiable compliance checks like age gates.
+
+## High-Level Component Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Mobile Applications                          │
+│  ┌──────────────────┐              ┌─────────────────────────┐  │
+│  │   Wallet App     │              │    POS/Merchant App     │  │
+│  │  (Kotlin/Compose)│              │   (Kotlin/Compose)      │  │
+│  │  - Stealth addrs │              │   - Proposal creation   │  │
+│  │  - ZK proof gen  │              │   - QR code display     │  │
+│  │  - NFC passport  │              │   - Settlement monitor  │  │
+│  └────────┬─────────┘              └──────────┬──────────────┘  │
+└───────────┼────────────────────────────────────┼─────────────────┘
+            │                                    │
+            │  HTTPS + WebSocket                 │
+            │                                    │
+┌───────────▼────────────────────────────────────▼─────────────────┐
+│                    Backend Services (Deno/Hono)                  │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  REST API (/api/identipay/v1/*)                             │ │
+│  │  - Proposals, Intents, Announcements, Names, Merchants      │ │
+│  │  - Gas sponsorship, Transaction building                    │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  Event Indexers (Polling)                                   │ │
+│  │  - Settlement events → Update proposal status               │ │
+│  │  - Stealth announcements → Store for wallet scanning        │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  PostgreSQL Database (Drizzle ORM)                          │ │
+│  │  - Proposals, Merchants, Announcements, Names cache         │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└───────────┬──────────────────────────────────────────────────────┘
+            │
+            │  Sui RPC (JSON-RPC 2.0)
+            │
+┌───────────▼──────────────────────────────────────────────────────┐
+│                    Sui Blockchain (Move)                         │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │  Core Protocol Modules                                      │ │
+│  │  - settlement.move        (atomic commerce execution)       │ │
+│  │  - shielded_pool.move     (privacy firewall)                │ │
+│  │  - zk_verifier.move       (Groth16 proof verification)      │ │
+│  │  - meta_address_registry  (name → public keys)              │ │
+│  │  - trust_registry.move    (merchant DIDs)                   │ │
+│  │  - announcements.move     (stealth address broadcast)       │ │
+│  │  - receipt.move           (encrypted receipt NFTs)          │ │
+│  │  - warranty.move          (encrypted warranty NFTs)         │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│              Zero-Knowledge Circuits (Circom)                    │
+│  - identity_registration.circom  (~700 constraints)              │
+│  - age_check.circom              (~1.2K constraints)             │
+│  - pool_spend.circom             (~35K constraints)              │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+## Layer 1: Smart Contracts (Sui Move)
+
+All protocol logic runs on Sui blockchain using Move smart contracts. The package consists of 9 interdependent modules:
+
+### Settlement Module
+
+**Location**: `contracts/sources/settlement.move`
+
+The core orchestrator for atomic commerce transactions. The `execute_commerce` entry function is the main entry point for all payments:
+
+```move
+entry fun execute_commerce<T>(
+    state: &mut SettlementState,
+    payment: &mut Coin<T>,
+    amount: u64,
+    merchant: address,
+    buyer_stealth_addr: address,
+    intent_sig: vector<u8>,
+    intent_hash: vector<u8>,
+    buyer_pubkey: vector<u8>,
+    proposal_expiry: u64,
+    zk_vk: &VerificationKey,
+    zk_proof: vector<u8>,
+    zk_public_inputs: vector<u8>,
+    encrypted_payload: vector<u8>,
+    // ... additional parameters
+    ctx: &mut TxContext,
+)
+```
+
+**Key Features**:
+- **Atomicity**: All operations succeed or fail together - no partial execution
+- **Replay protection**: Tracks executed intent hashes in `SettlementState.executed_intents`
+- **Expiry enforcement**: Rejects proposals past their timestamp
+- **Artifact delivery**: Mints encrypted `Receipt` and optional `Warranty` NFTs to buyer's stealth address
+
+<Info>
+The settlement module emits `SettlementEvent` indexed by `intent_hash`, NOT buyer identity, preserving anonymity.
+</Info>
+
+### Shielded Pool Module
+
+**Location**: `contracts/sources/shielded_pool.move`
+
+A privacy firewall for coin merging. When users need to combine funds from multiple stealth addresses, they deposit into the pool and withdraw to a fresh address via zero-knowledge proof.
+
+```move
+public struct ShieldedPool<phantom T> has key {
+    id: UID,
+    balance: Balance<T>,
+    merkle_root: u256,  // Poseidon Merkle tree of note commitments
+    nullifiers: Table<u256, bool>,  // Prevents double-spend
+    next_leaf_index: u64,
+    filled_subtrees: vector<u256>,  // Incremental Merkle tree state
+    tree_depth: u8,  // Default: 20 (1M capacity)
+}
+```
+
+**Deposit Flow**:
+```move
+entry fun deposit<T>(
+    pool: &mut ShieldedPool<T>,
+    coin: Coin<T>,
+    note_commitment: u256,  // Poseidon(amount, owner_key, salt)
+    _ctx: &mut TxContext,
+)
+```
+
+**Withdraw Flow** (requires ZK proof):
+```move
+entry fun withdraw<T>(
+    pool: &mut ShieldedPool<T>,
+    vk: &VerificationKey,
+    proof: vector<u8>,
+    public_inputs: vector<u8>,
+    nullifier: u256,  // Prevents re-spending same note
+    recipient: address,
+    amount: u64,
+    change_commitment: u256,  // If partial withdraw
+    ctx: &mut TxContext,
+)
+```
+
+The Merkle tree uses **Poseidon hashing over BN254** via Sui's native `poseidon::poseidon_bn254` function, ensuring compatibility with Circom circuits.
+
+<Tip>
+The shielded pool uses an incremental Merkle tree with "filled subtrees" optimization - O(depth) insertion without storing every node.
+</Tip>
+
+### ZK Verifier Module
+
+**Location**: `contracts/sources/zk_verifier.move`
+
+Verifies Groth16 zero-knowledge proofs on-chain using the BN254 elliptic curve. Verification keys are stored as shared objects:
+
+```move
+public struct VerificationKey has key, store {
+    id: UID,
+    alpha_g1: vector<u8>,     // G1 point (compressed)
+    beta_g2: vector<u8>,      // G2 point (compressed)
+    gamma_g2: vector<u8>,     // G2 point (compressed)
+    delta_g2: vector<u8>,     // G2 point (compressed)
+    ic: vector<vector<u8>>,   // IC[i] G1 points for public inputs
+}
+
+public fun verify_proof(
+    vk: &VerificationKey,
+    proof: &vector<u8>,
+    public_inputs: &vector<u8>,
+): bool
+```
+
+Three verification keys are deployed:
+- `identity_registration` VK (for name registration)
+- `age_check` VK (for age-gated transactions)
+- `pool_spend` VK (for shielded pool withdrawals)
+
+### Meta Address Registry
+
+**Location**: `contracts/sources/meta_address_registry.move`
+
+Maps human-readable names (`@alice.idpay`) to stealth address public key pairs:
+
+```move
+public struct MetaAddressRegistry has key {
+    id: UID,
+    names: Table<String, MetaAddress>,          // name → pubkeys
+    commitments: Table<vector<u8>, String>,     // identity commitment → name
+}
+
+public struct MetaAddress has store {
+    spend_pubkey: vector<u8>,  // 32-byte Ed25519 public key
+    view_pubkey: vector<u8>,   // 32-byte X25519 public key
+    registered_at: u64,
+}
+```
+
+**Key Invariants**:
+- Names are unique and immutable once registered
+- Identity commitment must be unique (prevents Sybil attacks)
+- Registration requires ZK proof of valid passport credentials
+
+### Trust Registry
+
+**Location**: `contracts/sources/trust_registry.move`
+
+Stores merchant DIDs (Decentralized Identifiers) for verification:
+
+```move
+public struct Merchant has store {
+    did: String,              // did:identipay:{hostname}:{uuid}
+    name: String,
+    sui_address: address,
+    public_key: vector<u8>,   // For ECDH encryption
+    registered_at: u64,
+    active: bool,
+}
+```
+
+Merchants are registered by the protocol admin (multi-sig in production). The backend verifies merchant API keys against this registry.
+
+### Announcements Module
+
+**Location**: `contracts/sources/announcements.move`
+
+Broadcasts stealth address outputs so recipients can discover incoming payments:
+
+```move
+public struct StealthAnnouncement has copy, drop {
+    ephemeral_pubkey: vector<u8>,  // 32-byte X25519 ephemeral key
+    view_tag: u8,                  // First byte of shared secret (fast scan)
+    stealth_address: address,       // Sui address of recipient
+    metadata: vector<u8>,           // Encrypted transaction metadata
+    timestamp: u64,
+}
+```
+
+Wallets scan announcements by:
+1. Filtering by view tag (1-byte fast check)
+2. Computing ECDH shared secret with ephemeral key
+3. Deriving stealth private key if the address belongs to them
+
+<CardGroup cols={2}>
+  <Card title="Receipt Module" icon="receipt">
+    Mints encrypted receipt NFTs to buyer's stealth address. Contains purchase details, merchant signature, and ECDH-encrypted payload.
+  </Card>
+  
+  <Card title="Warranty Module" icon="shield-check">
+    Optional encrypted warranty NFTs. Can be transferred to new owners if `transferable: true`.
+  </Card>
+  
+  <Card title="Intent Module" icon="file-signature">
+    Verifies Ed25519 signatures over canonical intent hashes to prove buyer authorization.
+  </Card>
+</CardGroup>
+
+## Layer 2: Backend Services (Deno + Hono)
+
+**Location**: `backend/src/`
+
+The backend is a Deno runtime application using Hono web framework, Drizzle ORM, and PostgreSQL. It provides:
+
+### REST API
+
+**Base URL**: `https://api.idpay.dev/api/identipay/v1`
+
+<AccordionGroup>
+  <Accordion title="POST /proposals" icon="plus">
+    **Auth**: API key (merchant only)
+    
+    Create a payment proposal with constraints:
+    
+    ```typescript
+    {
+      "amount": "5.00",
+      "currency": "USDC",
+      "description": "Coffee",
+      "constraints": {
+        "minAge": 18,  // Optional
+        "maxAge": null,
+        "requiredAttributes": []
+      },
+      "receiptTemplate": "...",
+      "warrantyTerms": "...",
+      "expiresInSeconds": 300
+    }
+    ```
+    
+    Returns QR code, transaction ID, and intent hash.
+  </Accordion>
+  
+  <Accordion title="GET /intents/:txId" icon="file-contract">
+    **Auth**: Public
+    
+    Resolve a proposal by transaction ID. Wallets fetch this to display transaction details before signing.
+    
+    Response includes:
+    - Intent hash (canonical transaction identifier)
+    - Merchant info (name, DID, public key, Sui address)
+    - Amount, currency, description
+    - Constraints (age gates, etc.)
+    - Expiry timestamp
+  </Accordion>
+  
+  <Accordion title="GET /announcements" icon="bell">
+    **Auth**: Public
+    
+    Query stealth announcements with pagination:
+    
+    ```typescript
+    GET /announcements?since=2026-03-09T00:00:00Z&limit=100&viewTag=42
+    ```
+    
+    The `viewTag` parameter is OPTIONAL - wallets SHOULD fetch all and filter locally to avoid revealing their view tag set to the backend (privacy invariant).
+  </Accordion>
+  
+  <Accordion title="GET /names/:name" icon="at">
+    **Auth**: Public
+    
+    Resolve a meta-address name to public keys:
+    
+    ```json
+    {
+      "name": "alice.idpay",
+      "spendPubkey": "0x...",
+      "viewPubkey": "0x...",
+      "registeredAt": 1234567890
+    }
+    ```
+    
+    Used by senders to derive stealth addresses for recipients.
+  </Accordion>
+  
+  <Accordion title="POST /merchants/register" icon="store">
+    **Auth**: Admin key
+    
+    Register a new merchant on-chain and issue API key:
+    
+    ```typescript
+    {
+      "name": "Coffee Shop",
+      "hostname": "coffee.example.com",
+      "suiAddress": "0x...",
+      "publicKey": "0x..."  // For ECDH encryption
+    }
+    ```
+    
+    Backend generates DID, submits to `trust_registry`, and returns API key.
+  </Accordion>
+</AccordionGroup>
+
+### Event Indexers
+
+**Polling Architecture**: The backend runs two polling loops at 3-second intervals to index blockchain events:
+
+```typescript
+// From main.ts:125-161
+async function pollSettlementEvents(): Promise<void> {
+  let cursor = await loadCursor(SETTLEMENT_CURSOR_KEY);
+  
+  while (hasMore) {
+    const result = await suiService.pollSettlementEvents(cursor);
+    
+    for (const event of result.events) {
+      // Update proposal status to "settled"
+      await db.update(proposals)
+        .set({ status: "settled", suiTxDigest: event.txDigest })
+        .where(eq(proposals.intentHash, event.intentHash));
+      
+      // Push WebSocket update to connected clients
+      pushSettlementUpdate(txId, "settled", event.txDigest);
+    }
+    
+    cursor = result.nextCursor;
+    await saveCursor(SETTLEMENT_CURSOR_KEY, cursor);
+  }
+}
+```
+
+**Settlement Indexer**:
+- Subscribes to `settlement::SettlementEvent`
+- Updates proposal status from `pending` → `settled`
+- Pushes WebSocket notifications to waiting clients
+
+**Announcement Indexer**:
+- Subscribes to `announcements::StealthAnnouncement`
+- Stores announcements in PostgreSQL for efficient wallet scanning
+- Allows filtering by view tag and timestamp
+
+### Gas Sponsorship
+
+Merchants can sponsor user transactions via the `/transactions/sponsor-send` endpoint:
+
+```typescript
+// POST /api/identipay/v1/transactions/sponsor-send
+{
+  "senderAddress": "0x...",  // User's stealth address
+  "amount": "5000000",       // USDC micros
+  "recipient": "0x...",      // Merchant's stealth address
+  "coinType": "0x...::usdc::USDC",
+  "ephemeralPubkey": [/* 32 bytes */],
+  "viewTag": 42
+}
+```
+
+Backend builds a PTB with two signers:
+1. **User** signs with stealth private key (owns the coin)
+2. **Gas sponsor** signs with backend key (owns the gas)
+
+This enables gasless transactions for end users.
+
+## Layer 3: Mobile Applications (Android/Kotlin)
+
+Two Android apps built with Jetpack Compose:
+
+### Wallet App
+
+**Location**: `android/wallet-app/`
+
+**Key Modules**:
+
+<CardGroup cols={2}>
+  <Card title="Crypto Layer" icon="lock">
+    `crypto/` - Native implementations:
+    - `PoseidonHash.kt` - BN254 field arithmetic
+    - `StealthAddress.kt` - ECDH key exchange, address derivation
+    - `Ed25519Ops.kt` - Signing with raw scalars
+    - `IdentityCommitment.kt` - Passport → commitment
+    - `SeedManager.kt` - BIP39 + passport-based KDF
+  </Card>
+  
+  <Card title="ZK Proof Generation" icon="microchip">
+    `zk/ProofGenerator.kt` - JNI bridge to Rust
+    - Loads compiled R1CS circuits
+    - Generates Groth16 proofs on-device
+    - Serializes proofs for Sui verification
+  </Card>
+  
+  <Card title="Data Layer" icon="database">
+    `data/` - Room database + Repositories:
+    - `StealthAddressDao` - Tracks owned addresses
+    - `NoteDao` - Tracks shielded pool notes
+    - `TransactionDao` - History
+    - `PaymentRepository` - Send/receive logic
+    - `PoolRepository` - Shielded pool interactions
+  </Card>
+  
+  <Card title="NFC Scanner" icon="nfc-symbol">
+    `nfc/PassportReader.kt` - ICAO 9303 reader:
+    - BAC (Basic Access Control) authentication
+    - DG1 (MRZ data) extraction
+    - DG15 (public key) for active auth
+    - SOD (Document Security Object) parsing
+  </Card>
+</CardGroup>
+
+**Payment Flow**:
+
+```kotlin
+// From PaymentRepository.kt:51-134
+suspend fun sendToName(name: String, amountMicros: Long): SendResult {
+    // 1. Resolve recipient meta-address
+    val resolution = backendApi.resolveName(name)
+    
+    // 2. Derive fresh stealth address for recipient
+    val stealth = stealthAddress.derive(
+        recipientSpendPub, 
+        recipientViewPub
+    )
+    
+    // 3. Find source coin with sufficient balance
+    var source = stealthAddressDao.getWithBalance()
+        .firstOrNull { it.balanceUsdc >= amountMicros }
+    
+    // 4. If no single coin is large enough, use pool-on-merge
+    if (source == null && totalBalance >= amountMicros) {
+        // Deposit all coins → withdraw to fresh address
+        poolOnMerge(sources, amountMicros)
+    }
+    
+    // 5. Build and submit gas-sponsored PTB
+    val txDigest = executeSendTransaction(
+        senderAddress = source.stealthAddress,
+        senderPrivKey = source.stealthPrivKeyEnc,
+        recipientStealthAddress = stealth.stealthAddress,
+        // ...
+    )
+    
+    return SendResult.Success(txDigest)
+}
+```
+
+**Balance Refresh**:
+The wallet scans for incoming payments by:
+1. Fetching announcements from backend
+2. Computing ECDH shared secret for each ephemeral key
+3. Deriving expected stealth address
+4. If match → store stealth private key, query on-chain balance
+
+### POS/Merchant App
+
+**Location**: `android/identipayPOS/`
+
+Simplified app for merchants to:
+- Create payment proposals
+- Display QR codes
+- Monitor settlement status via WebSocket
+- Print receipts on settlement
+
+## Layer 4: Zero-Knowledge Circuits (Circom)
+
+**Location**: `circuits/`
+
+### Identity Registration Circuit
+
+**File**: `identity_registration.circom` (~700 constraints)
+
+```circom
+template IdentityRegistration() {
+    signal input issuerCertHash;   // SHA-256(issuer cert) mod BN254_PRIME
+    signal input docNumberHash;    // SHA-256(doc number) mod BN254_PRIME
+    signal input dobHash;          // SHA-256(YYMMDD) mod BN254_PRIME
+    signal input userSalt;         // Random BN254 field element
+    
+    signal output identityCommitment;
+    
+    component hasher = Poseidon(4);
+    hasher.inputs[0] <== issuerCertHash;
+    hasher.inputs[1] <== docNumberHash;
+    hasher.inputs[2] <== dobHash;
+    hasher.inputs[3] <== userSalt;
+    
+    identityCommitment <== hasher.out;
+}
+```
+
+**Purpose**: Proves you have valid passport credentials without revealing any personal data. The on-chain registry stores only the commitment.
+
+### Age Check Circuit
+
+**File**: `age_check.circom` (~1.2K constraints)
+
+Proves `currentYear - birthYear >= minAge` without revealing exact birthdate. Uses range proofs via bit decomposition.
+
+### Pool Spend Circuit
+
+**File**: `pool_spend.circom` (~35K constraints)
+
+The most complex circuit. Proves:
+1. You own a note in the Merkle tree (membership proof)
+2. The nullifier is correctly derived (prevents double-spend)
+3. Withdraw amount ≤ note amount (range check via `Num2Bits(64)`)
+4. Change commitment is valid if partial withdraw
+
+<Note>
+All circuits use Poseidon hashing over BN254 scalar field for Merkle trees, matching Sui's native `poseidon::poseidon_bn254` implementation.
+</Note>
+
+## Security Properties
+
+<AccordionGroup>
+  <Accordion title="Transaction Anonymity" icon="mask">
+    **On-chain observers see**:
+    - Random-looking stealth addresses (no linkage)
+    - Transfer amounts (unavoidable for token transfers)
+    - Settlement events indexed by intent hash (NOT user identity)
+    
+    **On-chain observers do NOT see**:
+    - User's real identity or meta-address name
+    - Buyer's other transactions (no address reuse)
+    - Relationship between different stealth addresses
+  </Accordion>
+  
+  <Accordion title="Identity Privacy" icon="user-secret">
+    **Identity commitments hide**:
+    - Passport number
+    - Date of birth
+    - Nationality
+    - Issuing authority
+    
+    Only the Poseidon hash is stored on-chain. ZK proofs allow selective disclosure (e.g., age ≥ 18) without revealing underlying data.
+  </Accordion>
+  
+  <Accordion title="Merchant Privacy" icon="building-shield">
+    Merchants are NOT anonymous - they are registered in `trust_registry` with:
+    - DID (public identifier)
+    - Sui address (for receiving payments)
+    - Public key (for encrypting receipts)
+    
+    This is necessary for buyer protection and dispute resolution.
+  </Accordion>
+  
+  <Accordion title="Receipt Confidentiality" icon="envelope">
+    Receipts are encrypted via ECDH:
+    - Merchant generates ephemeral X25519 keypair
+    - Derives shared secret with buyer's view public key
+    - Encrypts receipt JSON with AES-256-GCM
+    - Stores encrypted blob on-chain
+    
+    Only the buyer can decrypt (using their view private key).
+  </Accordion>
+</AccordionGroup>
+
+## Deployment Architecture
+
+<Warning>
+**Current Status**: All components are deployed on testnets and development infrastructure. Do not use real funds or real identity documents.
+</Warning>
+
+- **Blockchain**: Sui Testnet
+- **Backend**: Cloud-hosted Deno service (PostgreSQL)
+- **Mobile**: Android APK (Google Play internal testing)
+- **Circuits**: Pre-compiled to R1CS, proving keys embedded in APK
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Smart Contracts" icon="file-code" href="/protocol/contracts">
+    Detailed contract specifications and Move API reference
+  </Card>
+  
+  <Card title="ZK Circuits" icon="microchip" href="/protocol/circuits">
+    Circuit design, constraint analysis, and proving system details
+  </Card>
+  
+  <Card title="Backend API" icon="server" href="/api-reference/introduction">
+    Complete REST API documentation with request/response schemas
+  </Card>
+  
+  <Card title="Mobile SDK" icon="mobile" href="/sdk/android">
+    Integration guide for building on top of identiPay
+  </Card>
+</CardGroup>

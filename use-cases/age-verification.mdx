@@ -1,0 +1,518 @@
+---
+title: Age Verification
+description: Zero-knowledge age proofs for privacy-preserving compliance
+icon: shield-check
+---
+
+identiPay enables age-gated purchases (alcohol, tobacco, gambling, etc.) without revealing customers' exact birth dates or identity documents. The `age_check` circuit generates a zero-knowledge proof that a user meets a minimum age threshold.
+
+## How It Works
+
+The age verification system uses a circom zero-knowledge circuit (~1500 constraints) that proves:
+
+> "I am at least N years old as of today, and this proof is bound to transaction T, and my identity commitment is C."
+
+**Without revealing:**
+- Your exact birth date
+- Your passport or identity documents
+- Any other personal information
+
+<CardGroup cols={3}>
+  <Card title="Private" icon="eye-slash">
+    Birth date stays on your device, never shared
+  </Card>
+  
+  <Card title="Binding" icon="link">
+    Proof is bound to a specific transaction intent
+  </Card>
+  
+  <Card title="Non-Replayable" icon="ban">
+    Cannot be reused for other transactions
+  </Card>
+</CardGroup>
+
+## The age_check Circuit
+
+The circuit is implemented in circom and compiled to a Groth16 proof system. Let's break down how it works.
+
+### Circuit Inputs
+
+The circuit has both **private inputs** (known only to the prover) and **public inputs** (verified on-chain):
+
+```circom
+// From circuits/age_check.circom
+
+// Private inputs (secret)
+signal input birthYear;        // e.g., 1998
+signal input birthMonth;       // 1-12
+signal input birthDay;         // 1-31
+signal input dobHash;          // Poseidon(birthYear, birthMonth, birthDay)
+signal input userSalt;         // Random salt from identity registration
+
+// Public inputs (visible on-chain)
+signal input ageThreshold;     // e.g., 21 for alcohol
+signal input referenceDate;    // Current date as YYYYMMDD integer (e.g., 20260309)
+signal input identityCommitment; // User's on-chain identity commitment
+signal input intentHash;       // Hash of the transaction intent
+```
+
+<Note>
+The `dobHash` and `identityCommitment` were created during identity registration when the user scanned their passport. See the identity setup documentation for details.
+</Note>
+
+### Step 1: Verify Date of Birth Hash
+
+The circuit first verifies that the private birth date matches the committed `dobHash`:
+
+```circom
+// From circuits/age_check.circom:39-45
+component dobHasher = Poseidon(3);
+dobHasher.inputs[0] <== birthYear;
+dobHasher.inputs[1] <== birthMonth;
+dobHasher.inputs[2] <== birthDay;
+dobHasher.out === dobHash;
+```
+
+This ensures the prover cannot lie about their birth date—it must match the hash committed during identity registration.
+
+### Step 2: Parse Reference Date
+
+The reference date (current date) is encoded as an integer like `20260309` (March 9, 2026). The circuit parses it into year, month, and day:
+
+```circom
+// From circuits/age_check.circom:48-68
+refMonthDay <-- referenceDate % 10000;
+refYear <-- (referenceDate - refMonthDay) / 10000;
+refYearTimes10000 <== refYear * 10000;
+refYearTimes10000 + refMonthDay === referenceDate;
+
+refDay <-- refMonthDay % 100;
+refMonth <-- (refMonthDay - refDay) / 100;
+refMonthTimes100 <== refMonth * 100;
+refMonthTimes100 + refDay === refMonthDay;
+```
+
+### Step 3: Range Checks
+
+The circuit ensures all date components are within valid ranges to prevent malicious witnesses:
+
+```circom
+// From circuits/age_check.circom:74-116
+// refMonth in [1, 12]
+component refMonthGte1 = GreaterEqThan(8);
+refMonthGte1.in[0] <== refMonth;
+refMonthGte1.in[1] <== 1;
+refMonthGte1.out === 1;
+
+component refMonthLte12 = LessEqThan(8);
+refMonthLte12.in[0] <== refMonth;
+refMonthLte12.in[1] <== 12;
+refMonthLte12.out === 1;
+
+// Similar checks for refDay, birthMonth, birthDay...
+```
+
+### Step 4: Compute Effective Age
+
+The circuit computes the user's age with month and day precision:
+
+```circom
+// From circuits/age_check.circom:118-138
+signal rawAge;
+rawAge <== refYear - birthYear;
+
+// Compute birthMonthDay and refMonthDay for comparison
+signal birthMonthDay;
+birthMonthDay <== birthMonth * 100 + birthDay;
+
+// hasBirthdayPassed: 1 if refMonthDay >= birthMonthDay, else 0
+component birthdayCheck = GreaterEqThan(16);
+birthdayCheck.in[0] <== refMonthDay;
+birthdayCheck.in[1] <== birthMonthDay;
+
+// effectiveAge = rawAge - (1 - hasBirthdayPassed)
+//              = rawAge - 1 + hasBirthdayPassed
+signal effectiveAge;
+effectiveAge <== rawAge - 1 + birthdayCheck.out;
+```
+
+**Example:** If you were born on April 15, 1998 and today is March 9, 2026:
+- `rawAge = 2026 - 1998 = 28`
+- `refMonthDay = 309`, `birthMonthDay = 415`
+- `hasBirthdayPassed = 0` (309 < 415)
+- `effectiveAge = 28 - 1 + 0 = 27` ✓ (birthday hasn't happened yet this year)
+
+### Step 5: Check Age Threshold
+
+The circuit verifies that the effective age meets the minimum requirement:
+
+```circom
+// From circuits/age_check.circom:140-146
+component ageGte = GreaterEqThan(16);
+ageGte.in[0] <== effectiveAge;
+ageGte.in[1] <== ageThreshold;
+ageGte.out === 1;
+```
+
+If `effectiveAge < ageThreshold`, the constraint fails and proof generation aborts.
+
+### Step 6: Bind Intent and Identity
+
+Finally, the circuit binds the proof to the specific transaction intent and identity commitment:
+
+```circom
+// From circuits/age_check.circom:148-158
+signal identitySquared;
+identitySquared <== identityCommitment * identityCommitment;
+
+signal intentSquared;
+intentSquared <== intentHash * intentHash;
+```
+
+These dummy constraints ensure `identityCommitment` and `intentHash` are included as public inputs and cannot be omitted by the prover.
+
+<Warning>
+**Intent hash binding** prevents proof replay. Each proof is cryptographically bound to a specific transaction intent (merchant, amount, timestamp). A proof generated for one purchase cannot be reused for another.
+</Warning>
+
+## Creating an Age Proof (Wallet Side)
+
+When a user attempts to purchase an age-restricted item, the wallet generates the proof automatically:
+
+```kotlin
+// From CheckoutViewModel.kt:102-153
+
+val hasAgeGate = proposal.constraints?.ageGate != null
+if (hasAgeGate) {
+    // 1. Load birth date from secure storage (set during identity registration)
+    val birthYear = userPreferences.getBirthYearOnce()
+    val birthMonth = userPreferences.getBirthMonthOnce()
+    val birthDay = userPreferences.getBirthDayOnce()
+    val userSalt = BigInteger(userPreferences.getUserSaltOnce())
+    val identityCommitment = BigInteger(userPreferences.getIdentityCommitmentOnce())
+
+    // 2. Compute dobHash = Poseidon(birthYear, birthMonth, birthDay)
+    val dobHash = PoseidonHash.hash3(
+        BigInteger.valueOf(birthYear.toLong()),
+        BigInteger.valueOf(birthMonth.toLong()),
+        BigInteger.valueOf(birthDay.toLong()),
+    )
+
+    // 3. Get current date as YYYYMMDD integer
+    val cal = Calendar.getInstance()
+    val referenceDate = cal.get(Calendar.YEAR) * 10000 +
+        (cal.get(Calendar.MONTH) + 1) * 100 +
+        cal.get(Calendar.DAY_OF_MONTH)
+
+    // 4. Extract age threshold from proposal (e.g., 21)
+    val ageThreshold = proposal.constraints!!.ageGate!!
+
+    // 5. Parse intent hash from proposal
+    val intentHashHex = proposal.intentHash.removePrefix("0x")
+    val intentHash = BigInteger(intentHashHex, 16).mod(PoseidonHash.FIELD_PRIME)
+
+    // 6. Build circuit input
+    val ageCheckInput = AgeCheckInput.create(
+        birthYear = birthYear,
+        birthMonth = birthMonth,
+        birthDay = birthDay,
+        dobHash = dobHash,
+        userSalt = userSalt,
+        ageThreshold = ageThreshold,
+        referenceDate = referenceDate,
+        identityCommitment = identityCommitment,
+        intentHash = intentHash,
+    )
+
+    // 7. Generate proof (uses snarkjs in WebView)
+    val proofResult = proofGenerator.generateAgeProof(ageCheckInput)
+    zkProofBytes = proofResult.proofBytes
+    zkPublicInputsBytes = proofResult.publicInputsBytes
+}
+```
+
+<Steps>
+  <Step title="Load identity secrets">
+    Birth date, user salt, and identity commitment are loaded from secure storage (set during passport NFC scan).
+  </Step>
+  
+  <Step title="Compute dobHash">
+    Hash the birth date using Poseidon to match the committed value from identity registration.
+  </Step>
+  
+  <Step title="Build circuit input">
+    Combine all private and public inputs into a JSON object for the circuit.
+  </Step>
+  
+  <Step title="Generate proof">
+    The `ProofGenerator` runs snarkjs in a WebView to compile the witness and generate the Groth16 proof (~2 seconds on mobile).
+  </Step>
+</Steps>
+
+### Proof Generation (snarkjs)
+
+The proof is generated client-side using snarkjs running in an invisible WebView:
+
+```kotlin
+// From ProofGenerator.kt:40-53
+
+suspend fun generateAgeProof(
+    input: AgeCheckInput,
+): ProofResult = withContext(Dispatchers.Main) {
+    generateProof("age_check", input.toJson())
+}
+
+private suspend fun generateProof(circuitName: String, inputJson: String): ProofResult {
+    // 1. Load WASM and zkey from assets
+    val wasmBytes = context.assets.open("circuits/${circuitName}.wasm").readBytes()
+    val zkeyBytes = context.assets.open("circuits/${circuitName}_final.zkey").readBytes()
+    
+    // 2. Inject into WebView and call snarkjs
+    webView.evaluateJavascript("generateProof($inputJson)", null)
+    
+    // 3. Wait for proof result from JavaScript bridge
+    return deferred.await()
+}
+```
+
+The proof is serialized into Sui-compatible format (arkworks little-endian) and returned as:
+- `proofBytes`: 256 bytes (G1 point A, G2 point B, G1 point C)
+- `publicInputsBytes`: 128 bytes (4 public inputs × 32 bytes each)
+
+<Accordion title="Why WebView instead of native ZK libraries?">
+snarkjs is the most mature and well-tested Groth16 implementation for circom circuits. While native Rust/Kotlin libraries exist, they lack the ecosystem maturity and would require significant porting effort. The WebView approach:
+
+- Reuses battle-tested snarkjs code
+- Supports all circom circuits without changes
+- Maintains compatibility with web wallet implementations
+- Generates proofs in ~2 seconds on modern mobile devices
+
+The WebView is invisible and destroyed after proof generation. All computation happens locally—no data is sent to any server.
+</Accordion>
+
+## Verifying the Proof (On-Chain)
+
+The on-chain settlement contract verifies the age proof before transferring funds:
+
+```move
+public entry fun settle_with_age_proof(
+    // ... payment parameters ...
+    zk_proof: vector<u8>,
+    zk_public_inputs: vector<u8>,
+    ctx: &mut TxContext
+) {
+    // 1. Parse public inputs
+    let age_threshold = bytes_to_field(slice(&zk_public_inputs, 0, 32));
+    let reference_date = bytes_to_field(slice(&zk_public_inputs, 32, 64));
+    let identity_commitment = bytes_to_field(slice(&zk_public_inputs, 64, 96));
+    let intent_hash = bytes_to_field(slice(&zk_public_inputs, 96, 128));
+    
+    // 2. Verify proof using Sui's groth16 module
+    let valid = groth16::verify(
+        &AGE_CHECK_VERIFYING_KEY,
+        &zk_proof,
+        &zk_public_inputs
+    );
+    assert!(valid, E_AGE_PROOF_INVALID);
+    
+    // 3. Verify intent hash matches the transaction parameters
+    let computed_intent = poseidon::hash(&[
+        merchant_did,
+        amount,
+        proposal_expiry,
+        age_threshold,
+        settlement_module
+    ]);
+    assert!(computed_intent == intent_hash, E_INTENT_HASH_MISMATCH);
+    
+    // 4. Verify identity commitment is registered on-chain
+    assert!(identity_registry::is_registered(identity_commitment), E_IDENTITY_NOT_REGISTERED);
+    
+    // 5. Proceed with payment
+    transfer::public_transfer(coin, merchant_address);
+    // ...
+}
+```
+
+<Steps>
+  <Step title="Parse public inputs">
+    Extract the 4 public inputs from the 128-byte blob: age threshold, reference date, identity commitment, and intent hash.
+  </Step>
+  
+  <Step title="Verify ZK proof">
+    Call Sui's `groth16::verify` with the age_check circuit's verifying key. This cryptographically proves the user meets the age threshold.
+  </Step>
+  
+  <Step title="Verify intent hash">
+    Recompute the intent hash from transaction parameters and ensure it matches the public input. This prevents proof replay.
+  </Step>
+  
+  <Step title="Verify identity registration">
+    Check that the identity commitment was registered on-chain during passport verification. This prevents fake identities.
+  </Step>
+  
+  <Step title="Proceed with payment">
+    If all checks pass, transfer USDC to the merchant.
+  </Step>
+</Steps>
+
+## Security Properties
+
+The age verification system provides strong security guarantees:
+
+<CardGroup cols={2}>
+  <Card title="Zero-Knowledge" icon="eye-slash">
+    The merchant and blockchain see only that the user is ≥ N years old, not their exact birth date.
+  </Card>
+  
+  <Card title="Non-Replayable" icon="ban">
+    Each proof is cryptographically bound to the transaction intent hash and cannot be reused.
+  </Card>
+  
+  <Card title="Identity-Bound" icon="fingerprint">
+    The proof is tied to the user's on-chain identity commitment, preventing proof sharing.
+  </Card>
+  
+  <Card title="Date Integrity" icon="calendar-check">
+    The birth date hash is committed during passport NFC verification, preventing lying.
+  </Card>
+</CardGroup>
+
+### Preventing Proof Replay
+
+The `intentHash` binding prevents several attack vectors:
+
+```
+Attack: Alice generates a proof for merchant A, then tries to use it at merchant B.
+Defense: The intent hash includes merchant A's DID, so the proof fails verification at merchant B.
+
+Attack: Alice generates a proof for a $10 purchase, then replays it for a $100 purchase.
+Defense: The intent hash includes the amount, so the proof fails for different amounts.
+
+Attack: Alice generates a proof with ageThreshold=18, then tries to use it for ageThreshold=21.
+Defense: The intent hash includes the age threshold, so the proof fails for different thresholds.
+```
+
+### Preventing Fake Identities
+
+The on-chain settlement contract verifies that `identityCommitment` was registered via the identity registration flow:
+
+```move
+assert!(identity_registry::is_registered(identity_commitment), E_IDENTITY_NOT_REGISTERED);
+```
+
+Identity commitments can only be created by:
+1. Scanning a passport via NFC
+2. Verifying the passport's passive authentication (RSA signature)
+3. Submitting a ZK proof of the identity_registration circuit
+
+This prevents users from creating fake identities with arbitrary birth dates.
+
+## User Experience Flow
+
+<Steps>
+  <Step title="User scans age-gated QR code">
+    The wallet detects that the merchant requires age verification (e.g., `ageGate: 21`).
+  </Step>
+  
+  <Step title="Wallet shows age requirement">
+    The review screen displays: "This merchant requires proof that you are 21 or older. Your exact birth date will not be shared."
+  </Step>
+  
+  <Step title="User confirms payment">
+    The wallet automatically generates the age proof in the background (~2 seconds).
+  </Step>
+  
+  <Step title="Payment succeeds or fails">
+    If the user is underage, the proof generation fails and the payment is rejected with a clear error message.
+  </Step>
+</Steps>
+
+```kotlin
+// From CheckoutViewModel.kt:188-209
+catch (e: Exception) {
+    val msg = e.message ?: ""
+    val isAgeFail = _uiState.value.step == CheckoutStep.PROVING_AGE ||
+        msg.contains("age", ignoreCase = true) ||
+        msg.contains("Proof generation failed", ignoreCase = true)
+    
+    if (isAgeFail) {
+        val ageRequired = _uiState.value.proposal?.constraints?.ageGate ?: 18
+        _uiState.update {
+            it.copy(
+                step = CheckoutStep.AGE_FAILED,
+                error = "You must be $ageRequired or older to complete this purchase.",
+            )
+        }
+    } else {
+        _uiState.update {
+            it.copy(
+                step = CheckoutStep.ERROR,
+                error = e.message ?: "Checkout failed",
+            )
+        }
+    }
+}
+```
+
+<Note>
+**Privacy-first design:** The wallet never asks for permission to access the birth date. It was already stored securely during identity registration, so age proofs are generated silently without additional user interaction.
+</Note>
+
+## Compliance and Regulations
+
+The age verification system is designed to comply with regulations like:
+
+- **21+ alcohol purchases** (US federal law)
+- **18+ tobacco purchases** (varies by jurisdiction)
+- **18+ gambling** (varies by jurisdiction)
+- **13+ COPPA compliance** (Children's Online Privacy Protection Act)
+
+Key compliance features:
+
+<Accordion title="Identity Verification">
+All identity commitments are created by scanning government-issued passports via NFC. The passport's passive authentication (RSA signature) is verified client-side, and a ZK proof of the identity_registration circuit is submitted on-chain.
+
+This meets the "reliable evidence" standard required by regulations like the UK Age Verification Act.
+</Accordion>
+
+<Accordion title="Audit Trail">
+Every age-gated transaction emits an on-chain event with:
+- Merchant DID
+- Buyer's identity commitment (pseudonymous)
+- Age threshold
+- Transaction timestamp
+- ZK proof hash
+
+Merchants can prove compliance by pointing regulators to on-chain settlement transactions with verified age proofs.
+</Accordion>
+
+<Accordion title="No Centralized Storage">
+Birth dates are stored only on the user's device, never on backend servers or smart contracts. This eliminates data breach risks and complies with GDPR's data minimization principle.
+</Accordion>
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Circuit constraints | ~1,500 |
+| Proof generation time (mobile) | ~2 seconds |
+| Proof size | 256 bytes |
+| Public inputs size | 128 bytes (4 × 32 bytes) |
+| On-chain verification gas | ~0.01 SUI (~$0.001) |
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="Identity Setup" icon="passport" href="/identity/setup">
+    Learn how to scan passports and register identities
+  </Card>
+  
+  <Card title="Merchant Payments" icon="store" href="/use-cases/merchant-payments">
+    See how age proofs fit into the full checkout flow
+  </Card>
+  
+  <Card title="Circuits Reference" icon="microchip" href="/circuits/age-check">
+    Explore the age_check circuit in detail
+  </Card>
+</CardGroup>

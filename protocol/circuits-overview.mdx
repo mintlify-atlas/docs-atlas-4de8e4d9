@@ -1,0 +1,247 @@
+---
+title: 'ZK Circuit System'
+description: 'Overview of identiPay zero-knowledge circuit architecture using Circom and Groth16 proofs'
+---
+
+## Overview
+
+identiPay uses zero-knowledge circuits built with [Circom](https://docs.circom.io/) to enable privacy-preserving identity verification and anonymous payments. The circuits are compiled to Groth16 proofs, which are verified on-chain in the Sui smart contracts.
+
+<Note>
+  All circuits use the BN254 elliptic curve and Groth16 proving system for efficient on-chain verification.
+</Note>
+
+## Circuit Architecture
+
+The protocol implements three core circuits:
+
+| Circuit | Constraints | Purpose |
+|---------|-------------|----------|
+| **identity_registration** | ~700 | Creates a privacy-preserving identity commitment |
+| **age_check** | ~1,500 | Proves minimum age without revealing birthdate |
+| **pool_spend** | ~35,000 | Proves ownership of shielded pool note for withdrawal |
+
+## Circuit Components
+
+### Circomlib Dependencies
+
+All circuits depend on `circomlib` for cryptographic primitives:
+
+```circom
+include "node_modules/circomlib/circuits/poseidon.circom";
+include "node_modules/circomlib/circuits/comparators.circom";
+include "node_modules/circomlib/circuits/bitify.circom";
+```
+
+**Key components:**
+- **Poseidon**: ZK-friendly hash function used for commitments and Merkle trees
+- **Comparators**: Range checks and inequality proofs (GreaterEqThan, LessEqThan, IsZero)
+- **Bitify**: Bit decomposition for range proofs (Num2Bits)
+
+### Field Arithmetic
+
+All circuits operate in the BN254 scalar field:
+- Field size: ~254 bits
+- Modulus: 21888242871839275222246405745257275088548364400416034343698204186575808495617
+- Compatible with Ethereum and Sui zkSNARK verifiers
+
+## Compilation Process
+
+Circuits are compiled using the `compile.sh` script via npm scripts:
+
+```json
+{
+  "scripts": {
+    "compile:identity": "bash scripts/compile.sh identity_registration",
+    "compile:age": "bash scripts/compile.sh age_check",
+    "compile:pool": "bash scripts/compile.sh pool_spend",
+    "compile:all": "npm run compile:identity && npm run compile:age"
+  }
+}
+```
+
+### Compilation Steps
+
+The compilation pipeline consists of four stages:
+
+<CodeGroup>
+```bash Step 1: Compile Circom
+# Generates R1CS constraints, WASM witness generator, and symbols
+circom identity_registration.circom \
+    --r1cs \
+    --wasm \
+    --sym \
+    -o build/
+```
+
+```bash Step 2: Download Powers of Tau
+# One-time download of trusted setup parameters (~18MB)
+curl -L -o build/powersOfTau28_hez_final_14.ptau \
+  https://storage.googleapis.com/zkevm/ptau/powersOfTau28_hez_final_14.ptau
+```
+
+```bash Step 3: Groth16 Setup
+# Generate proving and verification keys
+snarkjs groth16 setup \
+    build/identity_registration.r1cs \
+    build/powersOfTau28_hez_final_14.ptau \
+    build/identity_registration_0000.zkey
+
+# Contribute to trusted setup ceremony
+snarkjs zkey contribute \
+    build/identity_registration_0000.zkey \
+    build/identity_registration_0001.zkey \
+    --name="identipay dev" \
+    -e="identipay-dev-entropy"
+
+# Apply beacon for final zkey
+snarkjs zkey beacon \
+    build/identity_registration_0001.zkey \
+    build/identity_registration_final.zkey \
+    0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20 \
+    10 \
+    -n="Final beacon"
+```
+
+```bash Step 4: Export Verification Key
+# Extract verification key for on-chain deployment
+snarkjs zkey export verificationkey \
+    build/identity_registration_final.zkey \
+    build/identity_registration_verification_key.json
+```
+</CodeGroup>
+
+### Build Artifacts
+
+After compilation, the following artifacts are generated:
+
+<ParamField path="{circuit}_js/{circuit}.wasm" type="file">
+  WebAssembly witness generator. Used client-side to compute witness from private inputs.
+</ParamField>
+
+<ParamField path="{circuit}_final.zkey" type="file">
+  Final proving key. Used by the prover to generate Groth16 proofs.
+</ParamField>
+
+<ParamField path="{circuit}_verification_key.json" type="file">
+  Verification key in JSON format. Must be converted to Sui Move format and deployed on-chain.
+</ParamField>
+
+<ParamField path="{circuit}.r1cs" type="file">
+  Rank-1 Constraint System. Defines the circuit's constraints.
+</ParamField>
+
+## Proof Generation
+
+### Client-Side Workflow
+
+Proofs are generated in the user's browser or wallet:
+
+```typescript
+import { groth16 } from 'snarkjs';
+
+// 1. Prepare inputs (private + public)
+const inputs = {
+  // Private inputs (not revealed in proof)
+  issuerCertHash: "0x1234...",
+  docNumberHash: "0x5678...",
+  dobHash: "0xabcd...",
+  userSalt: "0xef01..."
+};
+
+// 2. Generate witness
+const { proof, publicSignals } = await groth16.fullProve(
+  inputs,
+  "identity_registration.wasm",
+  "identity_registration_final.zkey"
+);
+
+// 3. Format for Sui transaction
+const proofBytes = serializeGroth16Proof(proof);
+const publicInputs = serializePublicInputs(publicSignals);
+```
+
+<Warning>
+  The proving key (`.zkey`) and WASM files are typically 5-50MB each. Host them on a CDN or IPFS for production deployments.
+</Warning>
+
+## On-Chain Verification
+
+Proofs are verified on Sui using the `zk_verifier` module:
+
+```move
+use identipay::zk_verifier::{Self, VerificationKey};
+
+// Verification key is stored on-chain as a shared object
+public fun verify_identity(
+    vk: &VerificationKey,
+    proof: vector<u8>,
+    public_inputs: vector<u8>,
+): bool {
+    zk_verifier::verify_proof(vk, &proof, &public_inputs)
+}
+```
+
+See [ZK Verifier](/protocol/zk-verifier) for details on the on-chain verification implementation.
+
+## Security Considerations
+
+### Trusted Setup
+
+<Warning>
+  The Groth16 proving system requires a trusted setup ceremony. If the toxic waste from the ceremony is not properly destroyed, proofs could be forged.
+</Warning>
+
+**Mitigations:**
+- Use multi-party computation (MPC) for the trusted setup
+- Perform public ceremony with multiple contributors
+- For production, use the [Perpetual Powers of Tau](https://github.com/privacy-scaling-explorations/perpetualpowersoftau) ceremony
+
+### Circuit Security
+
+**Best practices implemented:**
+
+1. **Constraint completeness**: All inputs are properly constrained
+   - Example: Date parsing uses explicit range checks (1 ≤ month ≤ 12)
+   
+2. **Underflow prevention**: Comparisons use proper bit decomposition
+   - Example: `pool_spend.circom:129` uses `Num2Bits(64)` to prove non-negativity
+   
+3. **Public input binding**: Public inputs are constrained to prevent malleability
+   - Example: `age_check.circom:154-158` squares public inputs to prevent optimization
+
+4. **Nullifier uniqueness**: Deterministic nullifiers prevent double-spending
+   - Example: `nullifier = Poseidon(commitment, ownerKey)` in `pool_spend.circom:115`
+
+## Performance
+
+### Proving Time
+
+Estimated client-side proving times (browser, M1 MacBook):
+
+| Circuit | Constraints | Proving Time | Proof Size |
+|---------|-------------|--------------|------------|
+| identity_registration | ~700 | ~0.5s | 128 bytes |
+| age_check | ~1,500 | ~1s | 128 bytes |
+| pool_spend | ~35,000 | ~15s | 128 bytes |
+
+### Verification Cost
+
+On-chain verification gas costs on Sui:
+- Base cost: ~0.001 SUI per proof verification
+- Linear in number of public inputs
+- Independent of constraint count (Groth16 has constant verification time)
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="Identity Registration" icon="id-card" href="/protocol/identity-registration">
+    Create privacy-preserving identity commitments
+  </Card>
+  <Card title="Age Check" icon="calendar-check" href="/protocol/age-check">
+    Prove age without revealing birthdate
+  </Card>
+  <Card title="Pool Spend" icon="shield" href="/protocol/pool-spend">
+    Anonymous withdrawals from shielded pools
+  </Card>
+</CardGroup>

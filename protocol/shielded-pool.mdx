@@ -1,0 +1,445 @@
+---
+title: "Shielded Pool Contract"
+description: "Privacy firewall for coin merging using ZK proofs and Merkle trees"
+---
+
+## Overview
+
+The Shielded Pool contract (`identipay::shielded_pool`) provides a privacy layer for breaking address clustering. Users deposit coins with a cryptographic commitment, then withdraw to fresh stealth addresses via ZK proofs.
+
+This prevents observers from linking multiple stealth addresses belonging to the same user, as described in the whitepaper section 4.8.
+
+## Source Code
+
+Location: `contracts/sources/shielded_pool.move:11`
+
+## How It Works
+
+<Steps>
+  <Step title="Deposit">
+    User deposits tokens with a Poseidon commitment `C = Poseidon(amount, owner_pubkey, salt)`. The commitment is inserted into an incremental Merkle tree.
+  </Step>
+  
+  <Step title="Wait">
+    User waits for other deposits to mix their transaction in the anonymity set.
+  </Step>
+  
+  <Step title="Withdraw">
+    User generates a ZK proof that they own a note in the Merkle tree without revealing which one. The proof also derives a nullifier to prevent double-spending.
+  </Step>
+  
+  <Step title="Fresh Address">
+    Tokens are withdrawn to a new stealth address, breaking the link to previous addresses.
+  </Step>
+</Steps>
+
+## Data Structures
+
+### ShieldedPool
+
+The main pool object, generic over token type `<T>`.
+
+<ParamField body="id" type="UID" required>
+  Sui object identifier
+</ParamField>
+
+<ParamField body="balance" type="Balance<T>" required>
+  Pool's token balance
+</ParamField>
+
+<ParamField body="merkle_root" type="u256" required>
+  Current Merkle root (BN254 field element)
+</ParamField>
+
+<ParamField body="nullifiers" type="Table<u256, bool>" required>
+  Spent nullifiers for double-spend prevention
+</ParamField>
+
+<ParamField body="next_leaf_index" type="u64" required>
+  Next available leaf slot in the Merkle tree
+</ParamField>
+
+<ParamField body="filled_subtrees" type="vector<u256>" required>
+  Incremental Merkle tree state (one hash per level)
+</ParamField>
+
+<ParamField body="tree_depth" type="u8" required>
+  Merkle tree depth (default 20, supports 2^20 = ~1M notes)
+</ParamField>
+
+```move
+public struct ShieldedPool<phantom T> has key {
+    id: UID,
+    balance: Balance<T>,
+    merkle_root: u256,
+    nullifiers: Table<u256, bool>,
+    next_leaf_index: u64,
+    filled_subtrees: vector<u256>,
+    tree_depth: u8,
+}
+```
+
+### DepositEvent
+
+Emitted when tokens are deposited into the pool.
+
+<ResponseField name="note_commitment" type="u256">
+  Poseidon commitment C = Poseidon(amount, owner_pubkey, salt)
+</ResponseField>
+
+<ResponseField name="leaf_index" type="u64">
+  Position in the Merkle tree (needed for generating withdrawal proofs)
+</ResponseField>
+
+<ResponseField name="new_merkle_root" type="u256">
+  Updated Merkle root after insertion
+</ResponseField>
+
+```move
+public struct DepositEvent has copy, drop {
+    note_commitment: u256,
+    leaf_index: u64,
+    new_merkle_root: u256,
+}
+```
+
+### WithdrawEvent
+
+Emitted when tokens are withdrawn from the pool.
+
+<ResponseField name="nullifier" type="u256">
+  Unique nullifier N = Poseidon(commitment, owner_key)
+</ResponseField>
+
+<ResponseField name="recipient" type="address">
+  Fresh stealth address receiving the withdrawal
+</ResponseField>
+
+<ResponseField name="amount" type="u64">
+  Amount withdrawn
+</ResponseField>
+
+<ResponseField name="new_merkle_root" type="u256">
+  Updated Merkle root (if change commitment was added)
+</ResponseField>
+
+```move
+public struct WithdrawEvent has copy, drop {
+    nullifier: u256,
+    recipient: address,
+    amount: u64,
+    new_merkle_root: u256,
+}
+```
+
+## Entry Functions
+
+### create_pool
+
+Create a new shielded pool for a token type. Called once during deployment.
+
+```move
+entry fun create_pool<T>(ctx: &mut TxContext)
+```
+
+**Location:** `shielded_pool.move:77-101`
+
+### deposit
+
+Deposit tokens into the shielded pool with a note commitment.
+
+**Function Signature:**
+
+```move
+entry fun deposit<T>(
+    pool: &mut ShieldedPool<T>,
+    coin: Coin<T>,
+    note_commitment: u256,
+    _ctx: &mut TxContext,
+)
+```
+
+<ParamField path="pool" type="&mut ShieldedPool<T>" required>
+  Mutable reference to the shielded pool
+</ParamField>
+
+<ParamField path="coin" type="Coin<T>" required>
+  Coin to deposit (consumed entirely)
+</ParamField>
+
+<ParamField path="note_commitment" type="u256" required>
+  Poseidon commitment C = Poseidon(amount, owner_pubkey, salt)
+</ParamField>
+
+**Errors:**
+
+- `EZeroCommitment` (3): Note commitment is zero
+- `EPoolFull` (4): Merkle tree is at capacity
+- `EInvalidAmount` (5): Coin value is zero
+
+**Location:** `shielded_pool.move:113-139`
+
+**Example:**
+
+<CodeGroup>
+
+```typescript TypeScript
+import { TransactionBlock } from '@mysten/sui.js/transactions';
+import { poseidon } from '@identipay/crypto';
+
+// Generate note commitment off-chain
+const salt = randomBytes(32);
+const commitment = poseidon([
+  BigInt(amount),
+  BigInt(ownerPubkey),
+  BigInt(salt),
+]);
+
+// Deposit into pool
+const tx = new TransactionBlock();
+tx.moveCall({
+  target: `${PACKAGE_ID}::shielded_pool::deposit`,
+  typeArguments: [USDC_TYPE],
+  arguments: [
+    tx.object(POOL_ID),
+    tx.object(coinId),
+    tx.pure(commitment.toString()),
+  ],
+});
+
+await wallet.signAndExecuteTransactionBlock({ transactionBlock: tx });
+
+// Store note for later withdrawal
+const note = { amount, ownerPubkey, salt, leafIndex, commitment };
+saveNote(note);
+```
+
+</CodeGroup>
+
+### withdraw
+
+Withdraw tokens from the shielded pool using a ZK proof of note ownership.
+
+**Function Signature:**
+
+```move
+entry fun withdraw<T>(
+    pool: &mut ShieldedPool<T>,
+    vk: &VerificationKey,
+    proof: vector<u8>,
+    public_inputs: vector<u8>,
+    nullifier: u256,
+    recipient: address,
+    amount: u64,
+    change_commitment: u256,
+    ctx: &mut TxContext,
+)
+```
+
+<ParamField path="pool" type="&mut ShieldedPool<T>" required>
+  Mutable reference to the shielded pool
+</ParamField>
+
+<ParamField path="vk" type="&VerificationKey" required>
+  ZK verification key for the pool spend circuit
+</ParamField>
+
+<ParamField path="proof" type="vector<u8>" required>
+  Groth16 proof bytes
+</ParamField>
+
+<ParamField path="public_inputs" type="vector<u8>" required>
+  Public inputs: [merkle_root, nullifier, recipient, amount, change_commitment]
+</ParamField>
+
+<ParamField path="nullifier" type="u256" required>
+  Unique nullifier N = Poseidon(commitment, owner_key)
+</ParamField>
+
+<ParamField path="recipient" type="address" required>
+  Fresh stealth address for withdrawal
+</ParamField>
+
+<ParamField path="amount" type="u64" required>
+  Amount to withdraw
+</ParamField>
+
+<ParamField path="change_commitment" type="u256">
+  If withdrawing partial amount, commitment for change note. Pass 0 for full withdrawal.
+</ParamField>
+
+**Errors:**
+
+- `EInvalidAmount` (5): Amount is zero
+- `EZeroNullifier` (6): Nullifier is zero
+- `EInsufficientPoolBalance` (2): Pool doesn't have enough tokens
+- `ENullifierAlreadySpent` (0): This nullifier was already used
+- `EProofVerificationFailed` (1): ZK proof is invalid
+
+**Location:** `shielded_pool.move:150-193`
+
+**Example:**
+
+<CodeGroup>
+
+```typescript TypeScript
+import { generatePoolWithdrawProof } from '@identipay/zk';
+
+// Find a note to spend
+const note = await findNote(amount);
+
+// Generate Merkle proof for this note
+const { merkleProof, merkleRoot } = await getMerkleProof(
+  note.leafIndex
+);
+
+// Generate nullifier
+const nullifier = poseidon([note.commitment, ownerPrivateKey]);
+
+// Generate ZK proof
+const { proof, publicInputs } = await generatePoolWithdrawProof({
+  note,
+  merkleProof,
+  merkleRoot,
+  nullifier,
+  recipient: freshStealthAddress,
+  withdrawAmount: amount,
+  changeCommitment: 0, // full withdrawal
+});
+
+// Execute withdrawal
+const tx = new TransactionBlock();
+tx.moveCall({
+  target: `${PACKAGE_ID}::shielded_pool::withdraw`,
+  typeArguments: [USDC_TYPE],
+  arguments: [
+    tx.object(POOL_ID),
+    tx.object(VK_ID),
+    tx.pure(proof),
+    tx.pure(publicInputs),
+    tx.pure(nullifier.toString()),
+    tx.pure(freshStealthAddress),
+    tx.pure(amount),
+    tx.pure('0'), // no change
+  ],
+});
+
+await wallet.signAndExecuteTransactionBlock({ transactionBlock: tx });
+```
+
+</CodeGroup>
+
+## Public Functions
+
+### pool_balance
+
+```move
+public fun pool_balance<T>(pool: &ShieldedPool<T>): u64
+```
+
+Returns the pool's total token balance.
+
+### merkle_root
+
+```move
+public fun merkle_root<T>(pool: &ShieldedPool<T>): u256
+```
+
+Returns the current Merkle root.
+
+### next_leaf_index
+
+```move
+public fun next_leaf_index<T>(pool: &ShieldedPool<T>): u64
+```
+
+Returns the next available leaf index.
+
+### is_nullifier_spent
+
+```move
+public fun is_nullifier_spent<T>(
+    pool: &ShieldedPool<T>,
+    nullifier: u256
+): bool
+```
+
+Check if a nullifier has been spent.
+
+**Location:** `shielded_pool.move:200-202`
+
+## Merkle Tree Implementation
+
+The pool uses an **incremental Merkle tree** with Poseidon BN254 hashing for ZK circuit compatibility.
+
+### Tree Structure
+
+- **Depth**: 20 levels (supports 2^20 = 1,048,576 notes)
+- **Hash function**: Poseidon BN254 (2 inputs)
+- **Zero hash**: `0u256` at leaf level
+- **Storage**: O(depth) using filled subtrees approach
+
+### Insertion Algorithm
+
+```move
+fun insert_leaf<T>(pool: &mut ShieldedPool<T>, leaf: u256): u256
+```
+
+Inserts a leaf and returns the new Merkle root in O(depth) time.
+
+For each level from bottom to top:
+- If current index is even (left child): sibling is zero hash
+- If current index is odd (right child): sibling is filled_subtrees[level]
+- Compute parent as `Poseidon(left, right)`
+- Move up one level
+
+**Location:** `shielded_pool.move:226-258`
+
+## Privacy Guarantees
+
+<AccordionGroup>
+  <Accordion title="Anonymity Set" icon="users">
+    The privacy level equals the number of deposits in the pool. With 1,000 deposits, withdrawals have 1-in-1,000 anonymity.
+  </Accordion>
+  
+  <Accordion title="Unlinkability" icon="unlink">
+    Zero-knowledge proofs ensure observers cannot link deposits to withdrawals. Even the contract cannot determine which note is being spent.
+  </Accordion>
+  
+  <Accordion title="Double-Spend Prevention" icon="shield">
+    Nullifiers are cryptographically derived from note commitments. Each note can only be spent once, even though its commitment remains in the tree forever.
+  </Accordion>
+  
+  <Accordion title="Amount Privacy" icon="eye-slash">
+    Note amounts are hidden in Poseidon commitments. Observers only see withdrawal amounts, not which deposits they came from.
+  </Accordion>
+</AccordionGroup>
+
+## Security Considerations
+
+<Warning>
+  **Trusted Setup**: The ZK circuit for pool withdrawals requires a trusted setup. Use a multi-party computation ceremony for production deployments.
+</Warning>
+
+<Warning>
+  **Front-Running**: Deposits emit events with commitments. Ensure your wallet uses fresh randomness for each salt to prevent front-running attacks.
+</Warning>
+
+<Note>
+  **Merkle Root Updates**: The Merkle root changes with every deposit and change-note insertion. Wallet UIs should display the current root and leaf count.
+</Note>
+
+<Info>
+  **Gas Optimization**: Incremental Merkle tree insertion costs O(depth) = O(20) Poseidon hashes per deposit, which is efficient for on-chain execution.
+</Info>
+
+## Related Modules
+
+<CardGroup cols={2}>
+  <Card title="ZK Verifier" icon="lock" href="/protocol/zk-verifier">
+    Groth16 proof verification
+  </Card>
+  <Card title="Settlement" icon="hand-holding-dollar" href="/protocol/settlement">
+    Main commerce execution
+  </Card>
+</CardGroup>

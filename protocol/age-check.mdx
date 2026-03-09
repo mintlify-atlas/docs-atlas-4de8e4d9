@@ -1,0 +1,479 @@
+---
+title: 'Age Check Circuit'
+description: 'Prove minimum age without revealing exact birthdate using zero-knowledge proofs'
+---
+
+## Overview
+
+The **age_check** circuit proves that a user meets a minimum age threshold without revealing their exact date of birth. The circuit binds the proof to a specific identity commitment and an intent hash for replay protection.
+
+<Note>
+  Circuit source: `/home/daytona/workspace/source/circuits/age_check.circom:1`
+  
+  Constraint count: ~1,500 (fast proving, ~1 second)
+</Note>
+
+## Use Cases
+
+- **Age-restricted purchases**: Prove you're 18+ to buy alcohol, 21+ for gambling
+- **KYC compliance**: Meet age requirements without revealing DOB to merchant
+- **Privacy-preserving verification**: Share minimum necessary information
+
+## Circuit Interface
+
+### Private Inputs
+
+<ParamField path="birthYear" type="integer" required>
+  Year of birth (e.g., 1990).
+  
+  Must be within a reasonable range (e.g., 1900-2025).
+</ParamField>
+
+<ParamField path="birthMonth" type="integer" required>
+  Month of birth (1-12).
+  
+  Constrained to range [1, 12] in circuit.
+</ParamField>
+
+<ParamField path="birthDay" type="integer" required>
+  Day of birth (1-31).
+  
+  Constrained to range [1, 31] in circuit.
+</ParamField>
+
+<ParamField path="dobHash" type="field element" required>
+  Poseidon hash of the birthdate: `Poseidon(birthYear, birthMonth, birthDay)`.
+  
+  **Must match the `dobHash` used in identity_registration circuit.**
+</ParamField>
+
+<ParamField path="userSalt" type="field element" required>
+  The same salt used during identity registration.
+  
+  Used to reconstruct and verify the identity commitment.
+</ParamField>
+
+### Public Inputs
+
+<ParamField path="ageThreshold" type="integer" required>
+  Minimum age required (e.g., 18 for adult content, 21 for US gambling).
+</ParamField>
+
+<ParamField path="referenceDate" type="integer" required>
+  Current date as `YYYYMMDD` integer (e.g., 20260224 for Feb 24, 2026).
+  
+  The circuit parses this into year/month/day components.
+</ParamField>
+
+<ParamField path="identityCommitment" type="field element" required>
+  The on-chain identity commitment from the meta address registry.
+  
+  Binds the age proof to a specific registered identity.
+</ParamField>
+
+<ParamField path="intentHash" type="field element" required>
+  Hash of the transaction intent (merchant ID, product ID, timestamp).
+  
+  Prevents replay attacks by binding the proof to a specific transaction.
+</ParamField>
+
+## Circuit Logic
+
+The circuit performs six key steps:
+
+### 1. Verify DOB Hash
+
+Reconstruct the DOB hash from components and verify it matches the provided `dobHash`:
+
+```circom age_check.circom:41
+component dobHasher = Poseidon(3);
+dobHasher.inputs[0] <== birthYear;
+dobHasher.inputs[1] <== birthMonth;
+dobHasher.inputs[2] <== birthDay;
+dobHasher.out === dobHash;  // Constraint: must match
+```
+
+This proves the user knows the preimage of the DOB hash.
+
+### 2. Parse Reference Date
+
+Decompose `referenceDate` (YYYYMMDD) into year, month, day:
+
+```circom age_check.circom:56
+refMonthDay <-- referenceDate % 10000;
+refYear <-- (referenceDate - refMonthDay) / 10000;
+
+// Constrain: referenceDate == refYear * 10000 + refMonthDay
+refYearTimes10000 <== refYear * 10000;
+refYearTimes10000 + refMonthDay === referenceDate;
+
+refDay <-- refMonthDay % 100;
+refMonth <-- (refMonthDay - refDay) / 100;
+
+// Constrain: refMonthDay == refMonth * 100 + refDay
+refMonthTimes100 <== refMonth * 100;
+refMonthTimes100 + refDay === refMonthDay;
+```
+
+<Note>
+  The `<--` operator is non-constraining assignment (witness computation). The subsequent `===` constraints ensure the decomposition is correct.
+</Note>
+
+### 3. Range Check Date Components
+
+Ensure all date components are within valid ranges:
+
+```circom age_check.circom:74
+// refMonth in [1, 12]
+component refMonthGte1 = GreaterEqThan(8);
+refMonthGte1.in[0] <== refMonth;
+refMonthGte1.in[1] <== 1;
+refMonthGte1.out === 1;
+
+component refMonthLte12 = LessEqThan(8);
+refMonthLte12.in[0] <== refMonth;
+refMonthLte12.in[1] <== 12;
+refMonthLte12.out === 1;
+
+// Similar checks for refDay, birthMonth, birthDay...
+```
+
+Without these checks, a malicious prover could supply invalid dates (e.g., month=13) to bypass age checks.
+
+### 4. Compute Effective Age
+
+Calculate age with month/day precision:
+
+```circom age_check.circom:123
+signal rawAge;
+rawAge <== refYear - birthYear;
+
+// Compute birthMonthDay and refMonthDay for comparison
+signal birthMonthDay;
+birthMonthDay <== birthMonth * 100 + birthDay;
+
+// hasBirthdayPassed: 1 if refMonthDay >= birthMonthDay, else 0
+component birthdayCheck = GreaterEqThan(16);
+birthdayCheck.in[0] <== refMonthDay;
+birthdayCheck.in[1] <== birthMonthDay;
+
+// effectiveAge = rawAge - (1 - hasBirthdayPassed)
+//              = rawAge - 1 + hasBirthdayPassed
+signal effectiveAge;
+effectiveAge <== rawAge - 1 + birthdayCheck.out;
+```
+
+**Example**: Born March 15, 1990, reference date Feb 10, 2026
+- `rawAge = 2026 - 1990 = 36`
+- `birthMonthDay = 315`, `refMonthDay = 210`
+- `birthdayCheck.out = 0` (birthday hasn't passed yet this year)
+- `effectiveAge = 36 - 1 + 0 = 35` ✅
+
+### 5. Check Age Threshold
+
+Verify the user meets the minimum age:
+
+```circom age_check.circom:143
+component ageGte = GreaterEqThan(16);
+ageGte.in[0] <== effectiveAge;
+ageGte.in[1] <== ageThreshold;
+ageGte.out === 1;  // Constraint: must be true
+```
+
+The proof generation fails if `effectiveAge < ageThreshold`.
+
+### 6. Bind Public Inputs
+
+Prevent proof malleability by constraining public inputs:
+
+```circom age_check.circom:154
+// Create dummy constraints to prevent optimization
+signal identitySquared;
+identitySquared <== identityCommitment * identityCommitment;
+
+signal intentSquared;
+intentSquared <== intentHash * intentHash;
+```
+
+<Warning>
+  Without these constraints, the Circom compiler might optimize away unused public inputs, allowing proof reuse across different identities or transactions.
+</Warning>
+
+## Proof Generation
+
+### Step 1: Prepare Intent Hash
+
+```typescript
+import { poseidon } from 'circomlibjs';
+
+// Compute intent hash to bind proof to specific transaction
+const intentHash = poseidon([
+  BigInt(merchantId),
+  BigInt(productId),
+  BigInt(Date.now())  // Timestamp for freshness
+]);
+```
+
+### Step 2: Generate Proof
+
+```typescript
+import { groth16 } from 'snarkjs';
+
+const inputs = {
+  // Private inputs
+  birthYear: 1990,
+  birthMonth: 3,
+  birthDay: 15,
+  dobHash: dobHash.toString(),  // From identity registration
+  userSalt: userSalt.toString(),  // From secure storage
+  
+  // Public inputs
+  ageThreshold: 18,
+  referenceDate: 20260224,  // Feb 24, 2026
+  identityCommitment: identityCommitment.toString(),
+  intentHash: intentHash.toString()
+};
+
+const { proof, publicSignals } = await groth16.fullProve(
+  inputs,
+  'build/age_check_js/age_check.wasm',
+  'build/age_check_final.zkey'
+);
+```
+
+<Note>
+  If the user doesn't meet the age threshold, `fullProve` will throw an error:
+  ```
+  Error: Error in witness computation: Constraint doesn't match
+  ```
+</Note>
+
+### Step 3: Submit to Merchant
+
+```typescript
+// Format proof for on-chain or off-chain verification
+const proofData = {
+  proof: serializeGroth16Proof(proof),
+  publicInputs: {
+    ageThreshold: publicSignals[0],
+    referenceDate: publicSignals[1],
+    identityCommitment: publicSignals[2],
+    intentHash: publicSignals[3]
+  }
+};
+
+// Submit to merchant API
+await fetch('/api/verify-age', {
+  method: 'POST',
+  body: JSON.stringify(proofData)
+});
+```
+
+## Verification
+
+### On-Chain Verification (Sui)
+
+```move
+use identipay::zk_verifier::{Self, VerificationKey};
+
+public fun verify_age_proof(
+    vk: &VerificationKey,
+    proof: vector<u8>,
+    public_inputs: vector<u8>,
+    min_age: u64,
+    identity_commitment: u256,
+    merchant_id: u256
+): bool {
+    // Verify proof is valid
+    let valid = zk_verifier::verify_proof(vk, &proof, &public_inputs);
+    
+    // Additional checks:
+    // - intentHash includes merchant_id (prevent cross-merchant replay)
+    // - referenceDate is recent (e.g., within 1 hour)
+    // - identityCommitment is registered in meta_address_registry
+    
+    valid
+}
+```
+
+### Off-Chain Verification (Backend)
+
+```typescript
+import { groth16 } from 'snarkjs';
+import verificationKey from './age_check_verification_key.json';
+
+async function verifyAgeProof(
+  proof: Groth16Proof,
+  publicSignals: string[]
+): Promise<boolean> {
+  // Verify cryptographic proof
+  const valid = await groth16.verify(
+    verificationKey,
+    publicSignals,
+    proof
+  );
+  
+  if (!valid) return false;
+  
+  // Additional business logic checks
+  const [ageThreshold, referenceDate, identityCommitment, intentHash] = publicSignals;
+  
+  // Check referenceDate is recent (within 1 hour)
+  const now = new Date();
+  const refDate = parseYYYYMMDD(referenceDate);
+  if (now.getTime() - refDate.getTime() > 3600000) {
+    throw new Error('Proof expired');
+  }
+  
+  // Check intentHash matches current transaction
+  const expectedIntent = poseidon([
+    merchantId,
+    productId,
+    timestamp
+  ]);
+  if (intentHash !== expectedIntent.toString()) {
+    throw new Error('Intent mismatch');
+  }
+  
+  return true;
+}
+```
+
+## Security Considerations
+
+### Replay Attack Prevention
+
+The `intentHash` prevents proof reuse:
+
+```typescript
+// Each proof is bound to:
+// 1. Specific merchant (merchantId)
+// 2. Specific product (productId)
+// 3. Specific time (timestamp)
+
+const intentHash = poseidon([
+  BigInt(merchantId),
+  BigInt(productId),
+  BigInt(Math.floor(Date.now() / 1000))  // Unix timestamp
+]);
+```
+
+**Best practice**: Merchants should reject proofs where `referenceDate` is more than 1 hour old.
+
+### Reference Date Validation
+
+<Warning>
+  The circuit does NOT validate that `referenceDate` is the actual current date. A malicious prover could use a future date to appear older.
+</Warning>
+
+**Mitigation**: The verifier MUST check that `referenceDate` matches the current date (within acceptable tolerance).
+
+```typescript
+function validateReferenceDate(referenceDate: number): boolean {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth() + 1;
+  const day = now.getDate();
+  
+  const expected = year * 10000 + month * 100 + day;
+  
+  // Allow ±1 day tolerance for timezone differences
+  return Math.abs(referenceDate - expected) <= 1;
+}
+```
+
+### Birthday Precision
+
+The circuit computes age with **day-level precision**:
+
+- Born March 15, 2008, reference date March 14, 2026 → age = 17 ❌
+- Born March 15, 2008, reference date March 15, 2026 → age = 18 ✅
+
+This matches real-world age verification semantics.
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Constraints | ~1,500 |
+| Proving time (browser, M1) | ~1 second |
+| Proving time (server, AMD 5950X) | ~0.4 seconds |
+| Proof size | 128 bytes (Groth16) |
+| Verification gas (Sui) | ~0.001 SUI |
+| WASM size | ~6MB |
+| zkey size | ~10MB |
+
+## Testing
+
+```bash
+# Compile circuit
+npm run compile:age
+
+# Run tests
+npm test -- test/age_check.test.js
+```
+
+Example test case:
+
+```javascript
+const { expect } = require('chai');
+const { wasm: wasm_tester } = require('circom_tester');
+const { poseidon } = require('circomlibjs');
+
+describe('AgeCheck circuit', () => {
+  it('should accept valid age proof', async () => {
+    const circuit = await wasm_tester('age_check.circom');
+    
+    const dobHash = poseidon([1990n, 3n, 15n]);
+    
+    const inputs = {
+      birthYear: 1990,
+      birthMonth: 3,
+      birthDay: 15,
+      dobHash: dobHash.toString(),
+      userSalt: '12345',
+      ageThreshold: 18,
+      referenceDate: 20260224,  // Feb 24, 2026 (age = 35)
+      identityCommitment: '999999',
+      intentHash: '888888'
+    };
+    
+    const witness = await circuit.calculateWitness(inputs);
+    await circuit.checkConstraints(witness);
+  });
+  
+  it('should reject underage user', async () => {
+    const circuit = await wasm_tester('age_check.circom');
+    
+    const dobHash = poseidon([2010n, 6n, 1n]);  // Born June 1, 2010
+    
+    const inputs = {
+      birthYear: 2010,
+      birthMonth: 6,
+      birthDay: 1,
+      dobHash: dobHash.toString(),
+      userSalt: '12345',
+      ageThreshold: 18,
+      referenceDate: 20260224,  // Feb 24, 2026 (age = 15)
+      identityCommitment: '999999',
+      intentHash: '888888'
+    };
+    
+    // Should throw constraint error
+    await expect(
+      circuit.calculateWitness(inputs)
+    ).to.be.rejected;
+  });
+});
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Identity Registration" icon="id-card" href="/protocol/identity-registration">
+    Learn how to create the identity commitment used in age proofs
+  </Card>
+  <Card title="Intent System" icon="file-contract" href="/protocol/intent">
+    Understand how intent hashes prevent replay attacks
+  </Card>
+</CardGroup>

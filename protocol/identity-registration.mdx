@@ -1,0 +1,314 @@
+---
+title: 'Identity Registration Circuit'
+description: 'Generate privacy-preserving identity commitments using Poseidon hash'
+---
+
+## Overview
+
+The **identity_registration** circuit creates a Poseidon commitment over identity attributes. This commitment hides the user's document details behind a salt while allowing on-chain verification that the commitment was correctly formed.
+
+<Note>
+  Circuit source: `/home/daytona/workspace/source/circuits/identity_registration.circom:1`
+  
+  Constraint count: ~700 (fast proving, ~0.5 seconds)
+</Note>
+
+## Circuit Interface
+
+### Private Inputs
+
+These values remain hidden in the zero-knowledge proof:
+
+<ParamField path="issuerCertHash" type="field element" required>
+  Hash of the issuing authority's certificate (e.g., government CA).
+  
+  Computed as `Poseidon(issuerName, certPublicKey, expiryDate)` off-chain.
+</ParamField>
+
+<ParamField path="docNumberHash" type="field element" required>
+  Hash of the identity document number (passport, ID card, etc.).
+  
+  Computed as `Poseidon(documentNumber)` off-chain.
+</ParamField>
+
+<ParamField path="dobHash" type="field element" required>
+  Hash of the date of birth.
+  
+  Computed as `Poseidon(birthYear, birthMonth, birthDay)` off-chain.
+  
+  **Important**: This same value is reused in the age_check circuit.
+</ParamField>
+
+<ParamField path="userSalt" type="field element" required>
+  Random salt chosen by the user (minimum 128 bits of entropy).
+  
+  **CRITICAL**: Store this salt securely. It's required for all future proofs that reference this identity commitment.
+</ParamField>
+
+### Public Output
+
+<ResponseField name="identityCommitment" type="field element">
+  The Poseidon commitment over all four private inputs.
+  
+  Formula: `Poseidon(issuerCertHash, docNumberHash, dobHash, userSalt)`
+  
+  This commitment is published on-chain in the identity registry.
+</ResponseField>
+
+## Circuit Implementation
+
+The circuit is straightforward, consisting of a single Poseidon hash:
+
+```circom identity_registration.circom
+pragma circom 2.1.6;
+
+include "node_modules/circomlib/circuits/poseidon.circom";
+
+template IdentityRegistration() {
+    // Private inputs
+    signal input issuerCertHash;
+    signal input docNumberHash;
+    signal input dobHash;
+    signal input userSalt;
+
+    // Public output
+    signal output identityCommitment;
+
+    // Compute Poseidon hash over all four private inputs
+    component hasher = Poseidon(4);
+    hasher.inputs[0] <== issuerCertHash;
+    hasher.inputs[1] <== docNumberHash;
+    hasher.inputs[2] <== dobHash;
+    hasher.inputs[3] <== userSalt;
+
+    // Constrain the output
+    identityCommitment <== hasher.out;
+}
+
+component main = IdentityRegistration();
+```
+
+**Key points:**
+- Uses `Poseidon(4)` for hashing 4 inputs
+- All inputs are private by default (no `{public [...]}` declaration)
+- Output `identityCommitment` is automatically made public
+- ~700 constraints (mostly from Poseidon internals)
+
+## Proof Generation
+
+### Step 1: Prepare Inputs
+
+```typescript
+import { groth16 } from 'snarkjs';
+import { poseidon } from 'circomlibjs';
+
+// Hash document attributes
+const issuerCertHash = poseidon([
+  BigInt(issuerName),
+  BigInt(certPublicKey),
+  BigInt(expiryDate)
+]);
+
+const docNumberHash = poseidon([BigInt(documentNumber)]);
+
+const dobHash = poseidon([
+  BigInt(birthYear),
+  BigInt(birthMonth),
+  BigInt(birthDay)
+]);
+
+// Generate random salt (store securely!)
+const userSalt = BigInt('0x' + randomBytes(32).toString('hex'));
+
+// Prepare circuit inputs
+const inputs = {
+  issuerCertHash: issuerCertHash.toString(),
+  docNumberHash: docNumberHash.toString(),
+  dobHash: dobHash.toString(),
+  userSalt: userSalt.toString()
+};
+```
+
+<Warning>
+  The `userSalt` must be stored securely in the user's wallet. It cannot be recovered if lost, and without it, the user cannot prove ownership of their identity commitment in future transactions.
+</Warning>
+
+### Step 2: Generate Proof
+
+```typescript
+const { proof, publicSignals } = await groth16.fullProve(
+  inputs,
+  'build/identity_registration_js/identity_registration.wasm',
+  'build/identity_registration_final.zkey'
+);
+
+// publicSignals[0] is the identityCommitment
+const identityCommitment = publicSignals[0];
+console.log('Identity Commitment:', identityCommitment);
+```
+
+### Step 3: Register On-Chain
+
+```typescript
+import { Transaction } from '@mysten/sui';
+
+// Format proof for Sui
+const proofBytes = serializeGroth16Proof(proof);
+const publicInputs = serializePublicInputs(publicSignals);
+
+// Submit transaction
+const tx = new Transaction();
+tx.moveCall({
+  target: `${PACKAGE_ID}::meta_address_registry::register_identity`,
+  arguments: [
+    tx.object(META_ADDRESS_REGISTRY),
+    tx.object(VERIFICATION_KEY),
+    tx.pure('vector<u8>', proofBytes),
+    tx.pure('vector<u8>', publicInputs),
+    tx.pure('u256', identityCommitment)
+  ]
+});
+
+const result = await signAndExecuteTransaction({ transaction: tx });
+```
+
+See [Meta Address Registry](/protocol/meta-address-registry) for details on the on-chain registration flow.
+
+## Security Analysis
+
+### Commitment Security
+
+The identity commitment is **computationally hiding** and **binding**:
+
+1. **Hiding**: Given only `identityCommitment`, an attacker cannot determine the preimage values without breaking Poseidon collision resistance (~128-bit security).
+
+2. **Binding**: The user cannot produce a valid proof with different identity attributes that result in the same commitment (Poseidon collision resistance).
+
+### Salt Uniqueness
+
+<Warning>
+  **NEVER reuse the same `userSalt` for multiple identities**. If two users accidentally use the same salt and have the same issuer/DOB, their commitments will collide.
+</Warning>
+
+Best practice:
+```typescript
+// Derive salt from wallet seed + domain separation
+const salt = poseidon([
+  walletSeed,
+  BigInt('identipay-identity-v1')
+]);
+```
+
+### Input Validation
+
+<Note>
+  This circuit does NOT validate that the input hashes correspond to real documents. That validation happens off-chain during the KYC process before proof generation.
+</Note>
+
+The circuit only proves:
+- "I know a preimage (issuerCertHash, docNumberHash, dobHash, userSalt) that hashes to this commitment"
+
+It does NOT prove:
+- That the issuer is legitimate
+- That the document number is valid
+- That the DOB is formatted correctly
+
+These checks must be performed by the KYC provider before allowing proof generation.
+
+## Integration with Other Circuits
+
+### Age Check Circuit
+
+The `age_check` circuit reuses the same `identityCommitment` and `userSalt`:
+
+```circom
+// In age_check.circom, the commitment is reconstructed implicitly
+// by binding to the public input identityCommitment.
+// The userSalt is provided as a private input to prove knowledge.
+```
+
+See [Age Check](/protocol/age-check) for details.
+
+### Trust Registry
+
+Merchants can query the on-chain trust registry to check if an identity commitment is associated with a trusted issuer:
+
+```move
+// In trust_registry.move
+public fun is_trusted_identity(
+    registry: &TrustRegistry,
+    identity_commitment: u256,
+    issuer_cert_hash: u256
+): bool
+```
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Constraints | ~700 |
+| Proving time (browser, M1) | ~0.5 seconds |
+| Proving time (server, AMD 5950X) | ~0.2 seconds |
+| Proof size | 128 bytes (Groth16) |
+| Verification gas (Sui) | ~0.001 SUI |
+| WASM size | ~5MB |
+| zkey size | ~8MB |
+
+## Testing
+
+```bash
+# Compile circuit
+npm run compile:identity
+
+# Run tests
+npm test -- test/identity_registration.test.js
+```
+
+Example test case:
+
+```javascript
+const { expect } = require('chai');
+const { wasm: wasm_tester } = require('circom_tester');
+const { poseidon } = require('circomlibjs');
+
+describe('IdentityRegistration circuit', () => {
+  let circuit;
+
+  before(async () => {
+    circuit = await wasm_tester('identity_registration.circom');
+  });
+
+  it('should compute correct commitment', async () => {
+    const inputs = {
+      issuerCertHash: '12345',
+      docNumberHash: '67890',
+      dobHash: '11111',
+      userSalt: '99999'
+    };
+
+    const witness = await circuit.calculateWitness(inputs);
+    await circuit.checkConstraints(witness);
+
+    // Verify output matches expected Poseidon hash
+    const expectedCommitment = poseidon([
+      BigInt(inputs.issuerCertHash),
+      BigInt(inputs.docNumberHash),
+      BigInt(inputs.dobHash),
+      BigInt(inputs.userSalt)
+    ]);
+
+    expect(witness[1]).to.equal(expectedCommitment);
+  });
+});
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Age Check Circuit" icon="calendar-check" href="/protocol/age-check">
+    Prove minimum age using the same identity commitment
+  </Card>
+  <Card title="Meta Address Registry" icon="address-book" href="/protocol/meta-address-registry">
+    Register identity commitments on-chain
+  </Card>
+</CardGroup>

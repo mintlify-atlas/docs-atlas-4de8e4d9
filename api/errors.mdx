@@ -1,0 +1,349 @@
+---
+title: 'Error Handling'
+description: 'Error response format and status codes'
+---
+
+## Error Response Format
+
+All error responses follow a consistent JSON structure:
+
+```json
+{
+  "error": {
+    "code": "ERROR_CODE",
+    "message": "Human-readable error message",
+    "details": {}
+  }
+}
+```
+
+### Fields
+
+<ResponseField name="error.code" type="string" required>
+  Machine-readable error code (e.g., `VALIDATION_ERROR`, `NOT_FOUND`)
+</ResponseField>
+
+<ResponseField name="error.message" type="string" required>
+  Human-readable error description
+</ResponseField>
+
+<ResponseField name="error.details" type="object">
+  Additional error context (validation errors, field-specific issues)
+</ResponseField>
+
+## Error Codes
+
+The API uses standard HTTP status codes along with application-specific error codes.
+
+### 400 Bad Request
+
+**Code**: `VALIDATION_ERROR`
+
+Request validation failed. The `details` field contains information about which fields failed validation.
+
+**Example**:
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Invalid proposal input",
+    "details": {
+      "formErrors": [],
+      "fieldErrors": {
+        "amount.value": ["Required"]
+      }
+    }
+  }
+}
+```
+
+**Common Causes**:
+- Missing required fields
+- Invalid field types or formats
+- Value out of acceptable range
+- Invalid query parameters
+
+### 401 Unauthorized
+
+**Code**: `UNAUTHORIZED`
+
+Authentication failed or is required.
+
+**Example**:
+```json
+{
+  "error": {
+    "code": "UNAUTHORIZED",
+    "message": "Invalid API key"
+  }
+}
+```
+
+**Common Causes**:
+- Missing `Authorization` header
+- Invalid API key
+- Deactivated merchant account
+
+### 404 Not Found
+
+**Code**: `NOT_FOUND`
+
+The requested resource does not exist.
+
+**Example**:
+```json
+{
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "Name \"alice\" not found"
+  }
+}
+```
+
+**Common Causes**:
+- Name not registered
+- Proposal/transaction ID not found
+- Payment request not found
+- Merchant address not registered
+
+### 409 Conflict
+
+**Code**: `CONFLICT`
+
+The request conflicts with existing data.
+
+**Example**:
+```json
+{
+  "error": {
+    "code": "CONFLICT",
+    "message": "A merchant with this hostname already exists"
+  }
+}
+```
+
+**Common Causes**:
+- Duplicate merchant hostname
+- Name already registered (on-chain conflict)
+
+### 500 Internal Server Error
+
+**Code**: `INTERNAL_ERROR` or `SUI_ERROR`
+
+An unexpected server error occurred.
+
+**Example**:
+```json
+{
+  "error": {
+    "code": "INTERNAL_ERROR",
+    "message": "An unexpected error occurred"
+  }
+}
+```
+
+**Example (Sui Error)**:
+```json
+{
+  "error": {
+    "code": "SUI_ERROR",
+    "message": "Failed to submit transaction to Sui network",
+    "details": {
+      "digest": "...",
+      "error": "..."
+    }
+  }
+}
+```
+
+**Common Causes**:
+- Database connection failure
+- Sui RPC error
+- On-chain transaction failure
+- Service unavailability
+
+## Error Classes
+
+The backend defines the following error classes (see `errors/index.ts:1-47`):
+
+### AppError
+
+Base error class for all application errors.
+
+```typescript
+class AppError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    public readonly code: string,
+    message: string,
+    public readonly details?: unknown,
+  )
+}
+```
+
+### NotFoundError
+
+**Status**: 404  
+**Code**: `NOT_FOUND`
+
+Used when a requested resource does not exist.
+
+### ValidationError
+
+**Status**: 400  
+**Code**: `VALIDATION_ERROR`
+
+Used when request validation fails (invalid input).
+
+### AuthError
+
+**Status**: 401  
+**Code**: `UNAUTHORIZED`
+
+Used when authentication fails or is missing.
+
+### ConflictError
+
+**Status**: 409  
+**Code**: `CONFLICT`
+
+Used when the request conflicts with existing data.
+
+### SuiError
+
+**Status**: 500  
+**Code**: `SUI_ERROR`
+
+Used when Sui blockchain operations fail.
+
+## Domain-Specific Errors
+
+### Expired Proposals
+
+When fetching an expired proposal via `/intents/:txId`:
+
+**Status**: `400 Bad Request`
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Proposal has expired"
+  }
+}
+```
+
+### Cancelled Proposals
+
+**Status**: `400 Bad Request`
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Proposal has been cancelled"
+  }
+}
+```
+
+### Expired Payment Requests
+
+**Status**: `400 Bad Request`
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Payment request has expired"
+  }
+}
+```
+
+### Invalid Payment Request Status
+
+**Status**: `400 Bad Request`
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Payment request is paid"
+  }
+}
+```
+
+## Handling Errors
+
+### Client-Side Error Handling
+
+```typescript
+try {
+  const response = await fetch('/api/identipay/v1/names/alice');
+  const data = await response.json();
+  
+  if (!response.ok) {
+    const error = data.error;
+    
+    switch (error.code) {
+      case 'NOT_FOUND':
+        console.error('Name not registered:', error.message);
+        break;
+      case 'VALIDATION_ERROR':
+        console.error('Validation failed:', error.details);
+        break;
+      default:
+        console.error('Unexpected error:', error.message);
+    }
+    
+    return;
+  }
+  
+  // Success
+  console.log('Name resolved:', data);
+} catch (err) {
+  console.error('Network error:', err);
+}
+```
+
+### Validation Error Details
+
+Validation errors include a `details` field with the validation failure information from Zod:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Invalid merchant registration input",
+    "details": {
+      "formErrors": [],
+      "fieldErrors": {
+        "name": ["String must contain at least 1 character(s)"],
+        "suiAddress": ["Invalid"],
+        "publicKey": ["Must be 64-char lowercase hex"]
+      }
+    }
+  }
+}
+```
+
+## Best Practices
+
+<Check>
+  Always check the HTTP status code first, then inspect the error code
+</Check>
+
+<Check>
+  Use the `details` field for field-level validation errors
+</Check>
+
+<Check>
+  Log full error responses for debugging but show user-friendly messages to end users
+</Check>
+
+<Check>
+  Implement retry logic for `SUI_ERROR` and `INTERNAL_ERROR` (transient failures)
+</Check>
+
+<Warning>
+  Do not retry `VALIDATION_ERROR`, `NOT_FOUND`, `UNAUTHORIZED`, or `CONFLICT` errors
+</Warning>

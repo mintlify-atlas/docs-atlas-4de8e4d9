@@ -1,0 +1,573 @@
+---
+title: "Warranty Contract"
+description: "Transferable warranty NFTs with encrypted terms"
+---
+
+## Overview
+
+The Warranty contract (`identipay::warranty`) implements on-chain warranties as NFTs that are minted atomically with receipts during settlement.
+
+Warranties are:
+- **Linked to receipts**: Each warranty references its associated receipt
+- **Encrypted**: Warranty terms are AES-256-GCM ciphertext
+- **Expirable**: Plaintext expiry timestamp for on-chain enforcement
+- **Optionally transferable**: Can be marked transferable for resale scenarios
+
+## Source Code
+
+Location: `contracts/sources/warranty.move:6`
+
+## Data Structures
+
+### WarrantyObject
+
+On-chain warranty NFT minted during atomic settlement.
+
+<ParamField body="id" type="UID" required>
+  Sui object identifier (unique warranty ID)
+</ParamField>
+
+<ParamField body="receipt_id" type="ID" required>
+  Reference to the associated receipt object
+</ParamField>
+
+<ParamField body="merchant" type="address" required>
+  Merchant who issued the warranty
+</ParamField>
+
+<ParamField body="intent_hash" type="vector<u8>" required>
+  Intent hash binding this warranty to a specific transaction
+</ParamField>
+
+<ParamField body="encrypted_terms" type="vector<u8>" required>
+  AES-256-GCM ciphertext of warranty terms (duration, exclusions, service endpoints)
+</ParamField>
+
+<ParamField body="terms_nonce" type="vector<u8>" required>
+  12-byte GCM nonce for terms decryption
+</ParamField>
+
+<ParamField body="ephemeral_pubkey" type="vector<u8>" required>
+  Ephemeral public key E = e*G (same as receipt, for ECDH decryption)
+</ParamField>
+
+<ParamField body="expiry" type="u64" required>
+  Warranty expiry timestamp in epoch milliseconds (plaintext for on-chain enforcement)
+</ParamField>
+
+<ParamField body="transferable" type="bool" required>
+  Whether this warranty can be transferred (e.g., on resale)
+</ParamField>
+
+```move
+public struct WarrantyObject has key, store {
+    id: UID,
+    receipt_id: ID,
+    merchant: address,
+    intent_hash: vector<u8>,
+    encrypted_terms: vector<u8>,
+    terms_nonce: vector<u8>,
+    ephemeral_pubkey: vector<u8>,
+    expiry: u64,
+    transferable: bool,
+}
+```
+
+### Events
+
+#### WarrantyMinted
+
+Emitted when a warranty is minted.
+
+<ResponseField name="warranty_id" type="ID">
+  Unique object ID of the warranty
+</ResponseField>
+
+<ResponseField name="receipt_id" type="ID">
+  Associated receipt ID
+</ResponseField>
+
+<ResponseField name="merchant" type="address">
+  Merchant who issued the warranty
+</ResponseField>
+
+<ResponseField name="intent_hash" type="vector<u8>">
+  Intent hash
+</ResponseField>
+
+<ResponseField name="expiry" type="u64">
+  Warranty expiration timestamp
+</ResponseField>
+
+<ResponseField name="transferable" type="bool">
+  Whether warranty is transferable
+</ResponseField>
+
+#### WarrantyTransferred
+
+Emitted when a warranty is transferred.
+
+<ResponseField name="warranty_id" type="ID">
+  Warranty object ID
+</ResponseField>
+
+<ResponseField name="from" type="address">
+  Previous owner
+</ResponseField>
+
+<ResponseField name="to" type="address">
+  New owner
+</ResponseField>
+
+## Public Functions
+
+### mint_warranty
+
+Mint a new warranty. Called by the settlement module during atomic execution.
+
+**Function Signature:**
+
+```move
+public(package) fun mint_warranty(
+    receipt_id: ID,
+    merchant: address,
+    intent_hash: vector<u8>,
+    encrypted_terms: vector<u8>,
+    terms_nonce: vector<u8>,
+    ephemeral_pubkey: vector<u8>,
+    expiry: u64,
+    transferable: bool,
+    ctx: &mut TxContext,
+): WarrantyObject
+```
+
+<ParamField path="receipt_id" type="ID" required>
+  Object ID of the associated receipt
+</ParamField>
+
+<ParamField path="merchant" type="address" required>
+  Merchant's Sui address
+</ParamField>
+
+<ParamField path="intent_hash" type="vector<u8>" required>
+  Intent hash
+</ParamField>
+
+<ParamField path="encrypted_terms" type="vector<u8>" required>
+  AES-256-GCM ciphertext of warranty terms
+</ParamField>
+
+<ParamField path="terms_nonce" type="vector<u8>" required>
+  12-byte GCM nonce (must be exactly 12 bytes)
+</ParamField>
+
+<ParamField path="ephemeral_pubkey" type="vector<u8>" required>
+  Ephemeral X25519 public key (must be exactly 32 bytes)
+</ParamField>
+
+<ParamField path="expiry" type="u64" required>
+  Warranty expiration timestamp (epoch ms, must be > 0)
+</ParamField>
+
+<ParamField path="transferable" type="bool" required>
+  Whether the warranty can be transferred
+</ParamField>
+
+<ResponseField name="warranty" type="WarrantyObject">
+  The minted warranty object
+</ResponseField>
+
+**Errors:**
+
+- `EInvalidNonceLength` (2): Nonce is not 12 bytes
+- `EInvalidEphemeralPubkey` (3): Ephemeral pubkey is not 32 bytes
+- `EEmptyTerms` (4): Encrypted terms are empty
+- `EInvalidExpiry` (5): Expiry is 0
+
+**Visibility:** `public(package)` — only callable by the settlement module.
+
+**Location:** `warranty.move:65-103`
+
+### transfer_warranty
+
+Transfer a warranty to a new address. Only allowed if the warranty is marked as transferable and has not expired.
+
+**Function Signature:**
+
+```move
+public fun transfer_warranty(
+    warranty: WarrantyObject,
+    recipient: address,
+    ctx: &TxContext,
+)
+```
+
+<ParamField path="warranty" type="WarrantyObject" required>
+  Warranty object to transfer (consumed by this function)
+</ParamField>
+
+<ParamField path="recipient" type="address" required>
+  New owner's address
+</ParamField>
+
+**Errors:**
+
+- `EWarrantyNotTransferable` (0): Warranty has `transferable = false`
+- `EWarrantyExpired` (1): Current time exceeds warranty expiry
+
+**Location:** `warranty.move:107-122`
+
+**Example:**
+
+<CodeGroup>
+
+```typescript Transfer Warranty
+import { TransactionBlock } from '@mysten/sui.js/transactions';
+
+// User wants to transfer warranty when selling an item
+const tx = new TransactionBlock();
+
+tx.moveCall({
+  target: `${PACKAGE_ID}::warranty::transfer_warranty`,
+  arguments: [
+    tx.object(warrantyObjectId),
+    tx.pure(newOwnerAddress),
+  ],
+});
+
+await wallet.signAndExecuteTransactionBlock({ transactionBlock: tx });
+```
+
+</CodeGroup>
+
+## Accessors
+
+### receipt_id
+
+```move
+public fun receipt_id(warranty: &WarrantyObject): ID
+```
+
+Returns the associated receipt ID.
+
+### merchant
+
+```move
+public fun merchant(warranty: &WarrantyObject): address
+```
+
+Returns the merchant's address.
+
+### expiry
+
+```move
+public fun expiry(warranty: &WarrantyObject): u64
+```
+
+Returns the expiry timestamp.
+
+### is_transferable
+
+```move
+public fun is_transferable(warranty: &WarrantyObject): bool
+```
+
+Returns whether the warranty is transferable.
+
+### is_expired
+
+```move
+public fun is_expired(warranty: &WarrantyObject, ctx: &TxContext): bool
+```
+
+Returns whether the warranty has expired.
+
+**Location:** `warranty.move:149-155`
+
+## Warranty Terms Format
+
+The encrypted terms are a JSON object:
+
+```json
+{
+  "version": "1.0",
+  "warranty": {
+    "type": "manufacturer",
+    "duration": "90 days",
+    "coverage": [
+      "Manufacturing defects",
+      "Material defects",
+      "Workmanship issues"
+    ],
+    "exclusions": [
+      "Water damage",
+      "Accidental damage",
+      "Normal wear and tear"
+    ],
+    "serviceProcess": {
+      "claimEmail": "warranty@example.com",
+      "claimPhone": "+1-800-WARRANTY",
+      "claimPortal": "https://example.com/warranty/claim",
+      "requiredDocuments": [
+        "Original receipt",
+        "Photos of defect",
+        "Product serial number"
+      ]
+    },
+    "merchant": {
+      "name": "Example Electronics",
+      "supportEmail": "support@example.com"
+    }
+  }
+}
+```
+
+## Usage Example
+
+<CodeGroup>
+
+```typescript Buyer: Decrypt Warranty
+import { aesGcmDecrypt, hkdf } from '@identipay/crypto';
+import { sha256 } from '@noble/hashes/sha256';
+
+// Fetch warranty from chain
+const warranty = await suiClient.getObject({
+  id: warrantyId,
+  options: { showContent: true },
+});
+
+const {
+  encrypted_terms,
+  terms_nonce,
+  ephemeral_pubkey,
+  expiry,
+  transferable,
+} = warranty.data.content.fields;
+
+// Check if expired
+if (expiry <= Date.now()) {
+  console.log('Warranty has expired');
+  return;
+}
+
+// Derive shared secret (same as receipt decryption)
+const sharedSecret = deriveECDH(
+  stealthPrivateKey,
+  merchantPublicKeyFromRegistry
+);
+
+// Derive AES key
+const aesKey = hkdf(
+  sha256,
+  sharedSecret,
+  'identipay-warranty',
+  '',
+  32
+);
+
+// Decrypt terms
+const ciphertext = encrypted_terms.slice(0, -16);
+const tag = encrypted_terms.slice(-16);
+
+const plaintext = aesGcmDecrypt(
+  aesKey,
+  terms_nonce,
+  ciphertext,
+  tag
+);
+
+const warrantyTerms = JSON.parse(plaintext);
+console.log('Warranty coverage:', warrantyTerms.warranty.coverage);
+console.log('How to claim:', warrantyTerms.warranty.serviceProcess);
+```
+
+```typescript Merchant: Issue Warranty
+// During settlement preparation
+const warrantyTerms = {
+  version: '1.0',
+  warranty: {
+    type: 'manufacturer',
+    duration: '90 days',
+    coverage: ['Manufacturing defects', 'Material defects'],
+    exclusions: ['Water damage', 'Accidental damage'],
+    serviceProcess: {
+      claimEmail: 'warranty@myshop.com',
+      claimPortal: 'https://myshop.com/warranty',
+    },
+  },
+};
+
+// Encrypt terms (same process as receipt)
+const { ciphertext, nonce } = await encryptWarrantyTerms(
+  warrantyTerms,
+  ephemeralPrivateKey,
+  buyerPublicKey
+);
+
+// Include in settlement transaction
+await executeSettlement({
+  // ...
+  encrypted_warranty_terms: Array.from(ciphertext),
+  warranty_terms_nonce: Array.from(nonce),
+  warranty_expiry: Date.now() + 90 * 24 * 60 * 60 * 1000, // 90 days
+  warranty_transferable: true, // Allow resale
+});
+```
+
+```typescript Resale with Warranty Transfer
+import { TransactionBlock } from '@mysten/sui.js/transactions';
+
+// Seller transfers both item ownership and warranty
+const tx = new TransactionBlock();
+
+// 1. Transfer item NFT
+tx.transferObjects(
+  [tx.object(itemNftId)],
+  tx.pure(buyerAddress)
+);
+
+// 2. Transfer warranty
+tx.moveCall({
+  target: `${PACKAGE_ID}::warranty::transfer_warranty`,
+  arguments: [
+    tx.object(warrantyObjectId),
+    tx.pure(buyerAddress),
+  ],
+});
+
+// 3. Payment settlement (separate flow)
+// ...
+
+await sellerWallet.signAndExecuteTransactionBlock({
+  transactionBlock: tx,
+});
+
+console.log('Item and warranty transferred to buyer');
+```
+
+</CodeGroup>
+
+## Transferability Scenarios
+
+### Non-Transferable Warranties (Soulbound)
+
+For services or items that shouldn't be resold:
+
+```typescript
+// Merchant issues non-transferable warranty
+await executeSettlement({
+  // ...
+  warranty_transferable: false,
+});
+
+// Later, if user tries to transfer:
+try {
+  await transferWarranty(warranty, newOwner);
+} catch (e) {
+  // Fails with EWarrantyNotTransferable
+  console.error('This warranty cannot be transferred');
+}
+```
+
+**Use cases:**
+- Software licenses (personal, non-transferable)
+- Service warranties tied to original purchaser
+- Medical products with liability concerns
+
+### Transferable Warranties
+
+For physical goods that may be resold:
+
+```typescript
+// Merchant issues transferable warranty
+await executeSettlement({
+  // ...
+  warranty_transferable: true,
+});
+
+// User can transfer when selling the item
+await transferWarranty(warranty, newOwnerAddress);
+```
+
+**Use cases:**
+- Electronics (phones, laptops)
+- Appliances (refrigerators, washing machines)
+- Vehicles
+- Collectibles with authenticity guarantees
+
+## Warranty Claims
+
+Warranty claims happen off-chain using the decrypted terms:
+
+<Steps>
+  <Step title="Buyer Decrypts">
+    Buyer decrypts warranty terms to find claim process (email, portal, phone).
+  </Step>
+  
+  <Step title="Submit Claim">
+    Buyer submits claim via merchant's service portal with receipt proof.
+  </Step>
+  
+  <Step title="Merchant Verifies">
+    Merchant verifies:
+    - Warranty has not expired (check `expiry` on-chain)
+    - Receipt is authentic (check `receipt_id` matches on-chain)
+    - Claim falls under coverage (check decrypted terms)
+  </Step>
+  
+  <Step title="Resolution">
+    Merchant processes claim (repair, replacement, refund) per terms.
+  </Step>
+</Steps>
+
+## Privacy Guarantees
+
+<AccordionGroup>
+  <Accordion title="Terms Privacy" icon="eye-slash">
+    Warranty terms (coverage, exclusions, process) are encrypted on-chain. Only buyer and merchant can decrypt.
+  </Accordion>
+  
+  <Accordion title="Expiry Transparency" icon="clock">
+    Expiry is plaintext for on-chain enforcement. This prevents expired warranties from being transferred.
+  </Accordion>
+  
+  <Accordion title="Transferability Transparency" icon="arrow-right-arrow-left">
+    Transferability flag is plaintext so buyers know if they can resell the item with warranty.
+  </Accordion>
+  
+  <Accordion title="Buyer Anonymity" icon="user-secret">
+    Warranty is owned by a stealth address. On-chain observers cannot link it to buyer identity.
+  </Accordion>
+</AccordionGroup>
+
+## Security Considerations
+
+<Warning>
+  **Expiry Enforcement**: The `transfer_warranty` function checks expiry on-chain. Expired warranties cannot be transferred, preventing fraud.
+</Warning>
+
+<Note>
+  **Receipt Linkage**: Each warranty references its receipt via `receipt_id`. This enables verification that the warranty is authentic and corresponds to a real purchase.
+</Note>
+
+<Info>
+  **Merchant Decryption**: Merchants can decrypt all warranties they issued (for claim processing). This is necessary for warranty fulfillment.
+</Info>
+
+<Warning>
+  **Transfer Events**: Warranty transfers emit events. Merchants can track transfers to update their claim databases.
+</Warning>
+
+## Related Modules
+
+<CardGroup cols={2}>
+  <Card title="Settlement" icon="hand-holding-dollar" href="/protocol/settlement">
+    Mints warranties during atomic settlement
+  </Card>
+  <Card title="Receipt" icon="receipt" href="/protocol/receipt">
+    Associated receipt linked via receipt_id
+  </Card>
+  <Card title="Trust Registry" icon="certificate" href="/protocol/trust-registry">
+    Provides merchant public key for encryption
+  </Card>
+</CardGroup>

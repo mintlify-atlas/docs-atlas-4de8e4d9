@@ -1,0 +1,622 @@
+---
+title: 'POS App (Android)'
+description: 'Merchant point-of-sale application for accepting identiPay payments'
+icon: 'cash-register'
+---
+
+## Overview
+
+The identiPay POS (Point of Sale) app is an Android application for merchants to accept privacy-preserving payments. It creates payment proposals, displays QR codes, and monitors transaction settlement in real-time.
+
+## Features
+
+- **Product Catalog**: Display available products with prices
+- **Shopping Cart**: Add/remove items, calculate totals
+- **Age Gate**: Require age verification for restricted items
+- **Payment Proposals**: Generate time-limited payment requests
+- **QR Code Display**: Show payment QR codes for wallet app scanning
+- **NFC Support**: Enable tap-to-pay via NFC
+- **Receipt Printing**: Print receipts on connected thermal printers
+- **Real-time Settlement**: Monitor transaction status via WebSocket
+- **Transaction History**: View completed payments
+
+## Setup Instructions
+
+<Steps>
+
+<Step title="Clone the Repository">
+
+```bash
+git clone https://github.com/your-org/identipay.git
+cd identipay/android/identipayPOS
+```
+
+</Step>
+
+<Step title="Configure Backend URL">
+
+Update the backend configuration in `app/src/main/java/com/identipay/identipaypos/data/IdentipayApi.kt`:
+
+```kotlin
+object IdentipayApi {
+    const val BACKEND_URL = "https://identipay.me"
+    const val API_KEY = "REPLACE_WITH_YOUR_API_KEY"
+
+    val backendHost: String
+        get() = BACKEND_URL.removePrefix("http://").removePrefix("https://")
+}
+```
+
+<Note>
+Contact your identiPay administrator to obtain a merchant API key.
+</Note>
+
+</Step>
+
+<Step title="Register Merchant Account">
+
+Before using the POS app, you need to register your merchant account with the backend:
+
+```bash
+curl -X POST https://identipay.me/api/identipay/v1/merchants \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Your Store Name",
+    "suiAddress": "0x...",
+    "hostname": "yourstore.com",
+    "publicKey": "...",
+    "apiKey": "..."
+  }'
+```
+
+</Step>
+
+<Step title="Build and Install">
+
+```bash
+# Build the app
+./gradlew assembleDebug
+
+# Install on device
+./gradlew installDebug
+```
+
+</Step>
+
+</Steps>
+
+## Creating Payment Proposals
+
+The POS app creates payment proposals that customers scan with their wallet app:
+
+```kotlin IdentipayApi.kt
+suspend fun createProposal(
+    items: List<CartItem>,
+    total: Double,
+    ageGate: Int?,
+): ProposalResponse = withContext(Dispatchers.IO) {
+    val requestBody = ProposalRequest(
+        items = items.map { item ->
+            ProposalItem(
+                name = item.product.name,
+                quantity = item.quantity,
+                unitPrice = "%.2f".format(item.product.price),
+                currency = item.product.currency,
+            )
+        },
+        amount = ProposalAmount(
+            value = "%.2f".format(total),
+            currency = "USDC",
+        ),
+        deliverables = ProposalDeliverables(receipt = true),
+        constraints = if (ageGate != null && ageGate > 0) 
+            ProposalConstraints(ageGate = ageGate) 
+        else null,
+        expiresInSeconds = 900,
+    )
+
+    val body = gson.toJson(requestBody).toRequestBody(JSON_MEDIA)
+    val request = Request.Builder()
+        .url("$BACKEND_URL/api/identipay/v1/proposals")
+        .addHeader("Authorization", "Bearer $API_KEY")
+        .addHeader("Content-Type", "application/json")
+        .post(body)
+        .build()
+
+    val response = client.newCall(request).execute()
+    val responseBody = response.body?.string() 
+        ?: throw Exception("Empty response")
+
+    if (!response.isSuccessful) {
+        throw Exception(
+            "Proposal creation failed (${response.code}): $responseBody"
+        )
+    }
+
+    gson.fromJson(responseBody, ProposalResponse::class.java)
+}
+```
+
+## Payment Request Models
+
+### Request Structure
+
+```kotlin
+data class ProposalRequest(
+    val items: List<ProposalItem>,
+    val amount: ProposalAmount,
+    val deliverables: ProposalDeliverables,
+    val constraints: ProposalConstraints? = null,
+    val expiresInSeconds: Int,
+)
+
+data class ProposalItem(
+    val name: String,
+    val quantity: Int,
+    val unitPrice: String,
+    val currency: String,
+)
+
+data class ProposalAmount(
+    val value: String,
+    val currency: String,
+)
+
+data class ProposalDeliverables(
+    val receipt: Boolean,
+)
+
+data class ProposalConstraints(
+    val ageGate: Int, // Minimum age requirement
+)
+```
+
+### Response Structure
+
+```kotlin
+data class ProposalResponse(
+    val transactionId: String,
+    val intentHash: String,
+    val qrDataUrl: String? = null,
+    val uri: String,
+    val expiresAt: String,
+)
+```
+
+## Payment Flow
+
+<Steps>
+
+<Step title="Build Cart">
+
+Add products to the cart:
+
+```kotlin
+data class CartState(
+    val items: List<CartItem> = emptyList(),
+) {
+    val total: Double
+        get() = items.sumOf { it.product.price * it.quantity }
+}
+
+data class CartItem(
+    val product: Product,
+    val quantity: Int,
+)
+```
+
+</Step>
+
+<Step title="Create Proposal">
+
+Generate payment proposal with optional age gate:
+
+```kotlin
+val proposal = IdentipayApi.createProposal(
+    items = cartItems,
+    total = cartTotal,
+    ageGate = if (requiresAgeCheck) 21 else null,
+)
+```
+
+</Step>
+
+<Step title="Display QR Code">
+
+Show QR code and NFC prompt:
+
+```kotlin
+val qrBitmap = BitmapFactory.decodeByteArray(
+    Base64.decode(proposal.qrDataUrl, Base64.DEFAULT),
+    0,
+    Base64.decode(proposal.qrDataUrl, Base64.DEFAULT).size,
+)
+
+Image(
+    bitmap = qrBitmap.asImageBitmap(),
+    contentDescription = "Payment QR Code",
+)
+```
+
+</Step>
+
+<Step title="Monitor Settlement">
+
+Connect to WebSocket for real-time status updates:
+
+```kotlin
+val wsUrl = "wss://${IdentipayApi.backendHost}/ws/transactions/${proposal.transactionId}"
+
+webSocket.onMessage { message ->
+    val update = json.decodeFromString<SettlementUpdate>(message)
+    when (update.status) {
+        "pending" -> showWaitingState()
+        "settled" -> showSuccessState(update.txDigest)
+        "expired" -> showExpiredState()
+        "cancelled" -> showCancelledState()
+    }
+}
+```
+
+</Step>
+
+<Step title="Print Receipt">
+
+Once settled, print receipt if printer is available:
+
+```kotlin
+if (printerService.isBound()) {
+    val receipt = formatReceipt(
+        items = cartItems,
+        total = cartTotal,
+        txDigest = settlement.txDigest,
+        timestamp = System.currentTimeMillis(),
+    )
+    printerService.print(receipt)
+}
+```
+
+</Step>
+
+</Steps>
+
+## Receipt Printing
+
+The POS app integrates with thermal receipt printers:
+
+### Printer Service Integration
+
+```kotlin MainActivity.kt
+private fun bindToPrinterService() {
+    val intent = Intent().apply {
+        component = ComponentName(
+            "recieptservice.com.recieptservice",
+            "recieptservice.com.recieptservice.service.PrinterService"
+        )
+    }
+    try {
+        bindService(
+            intent, 
+            printerServiceConnection, 
+            Context.BIND_AUTO_CREATE
+        )
+        Log.i(TAG, "Binding to printer service...")
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to bind to printer service", e)
+    }
+}
+```
+
+### Receipt Format
+
+```kotlin ReceiptPrinter.kt
+fun formatReceipt(
+    merchantName: String,
+    items: List<CartItem>,
+    total: Double,
+    txDigest: String,
+    timestamp: Long,
+): String {
+    return buildString {
+        appendLine("================================")
+        appendLine("       $merchantName")
+        appendLine("================================")
+        appendLine()
+        
+        items.forEach { item ->
+            appendLine("${item.product.name}")
+            appendLine(
+                "  ${item.quantity} x $${item.product.price} = " +
+                "$${item.quantity * item.product.price}"
+            )
+        }
+        
+        appendLine()
+        appendLine("--------------------------------")
+        appendLine("TOTAL: $$total USDC")
+        appendLine("--------------------------------")
+        appendLine()
+        appendLine("Payment Method: identiPay")
+        appendLine("Transaction: ${txDigest.take(16)}...")
+        appendLine("Time: ${formatTimestamp(timestamp)}")
+        appendLine()
+        appendLine("    Thank you for shopping!")
+        appendLine("================================")
+    }
+}
+```
+
+## Product Management
+
+### Product Data Model
+
+```kotlin Product.kt
+data class Product(
+    val id: String,
+    val name: String,
+    val price: Double,
+    val currency: String = "USDC",
+    val imageRes: Int? = null,
+    val category: String,
+    val ageRestricted: Boolean = false,
+    val minimumAge: Int? = null,
+)
+```
+
+### Sample Product Catalog
+
+```kotlin
+val sampleProducts = listOf(
+    Product(
+        id = "1",
+        name = "Coffee",
+        price = 3.50,
+        category = "Beverages",
+    ),
+    Product(
+        id = "2",
+        name = "Beer",
+        price = 5.00,
+        category = "Alcohol",
+        ageRestricted = true,
+        minimumAge = 21,
+    ),
+    Product(
+        id = "3",
+        name = "Sandwich",
+        price = 8.00,
+        category = "Food",
+    ),
+)
+```
+
+## Age-Restricted Products
+
+For products that require age verification:
+
+<Steps>
+
+<Step title="Mark Product as Age-Restricted">
+
+```kotlin
+val product = Product(
+    name = "Wine",
+    price = 15.00,
+    ageRestricted = true,
+    minimumAge = 21,
+)
+```
+
+</Step>
+
+<Step title="Include Age Gate in Proposal">
+
+```kotlin
+val maxAge = cartItems
+    .filter { it.product.ageRestricted }
+    .maxOfOrNull { it.product.minimumAge ?: 0 }
+
+val proposal = IdentipayApi.createProposal(
+    items = cartItems,
+    total = total,
+    ageGate = maxAge,
+)
+```
+
+</Step>
+
+<Step title="Customer Proves Age">
+
+The wallet app automatically generates a zero-knowledge proof of age without revealing the exact date of birth.
+
+</Step>
+
+</Steps>
+
+<Warning>
+Age-restricted sales require the customer's wallet to support ZK age proofs. The transaction will fail if the customer is underage or cannot generate the proof.
+</Warning>
+
+## UI Components
+
+### Store Screen
+
+Displays products and cart:
+
+```kotlin StoreScreen.kt
+@Composable
+fun StoreScreen(
+    products: List<Product>,
+    cart: CartState,
+    onAddToCart: (Product) -> Unit,
+    onCheckout: () -> Unit,
+) {
+    Column {
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(2),
+        ) {
+            items(products) { product ->
+                ProductCard(
+                    product = product,
+                    onAddToCart = { onAddToCart(product) },
+                )
+            }
+        }
+        
+        CartSummary(
+            cart = cart,
+            onCheckout = onCheckout,
+        )
+    }
+}
+```
+
+### Checkout Screen
+
+Displays QR code and monitors payment:
+
+```kotlin CheckoutScreen.kt
+@Composable
+fun CheckoutScreen(
+    proposal: ProposalResponse,
+    onSettled: (String) -> Unit,
+) {
+    val settlementState by rememberSettlementListener(
+        transactionId = proposal.transactionId,
+        onSettled = onSettled,
+    )
+    
+    when (settlementState) {
+        is SettlementState.Waiting -> QRCodeView(proposal)
+        is SettlementState.Settled -> SuccessView(settlementState.txDigest)
+        is SettlementState.Expired -> ExpiredView()
+    }
+}
+```
+
+## WebSocket Settlement Listener
+
+```kotlin SettlementListener.kt
+@Composable
+fun rememberSettlementListener(
+    transactionId: String,
+    onSettled: (String) -> Unit,
+): State<SettlementState> {
+    val state = remember { mutableStateOf<SettlementState>(SettlementState.Waiting) }
+    
+    LaunchedEffect(transactionId) {
+        val wsUrl = "wss://${IdentipayApi.backendHost}/ws/transactions/$transactionId"
+        
+        webSocketClient.connect(wsUrl) { message ->
+            val update = Json.decodeFromString<SettlementUpdate>(message)
+            
+            state.value = when (update.status) {
+                "settled" -> {
+                    onSettled(update.txDigest!!)
+                    SettlementState.Settled(update.txDigest)
+                }
+                "expired" -> SettlementState.Expired
+                else -> SettlementState.Waiting
+            }
+        }
+    }
+    
+    return state
+}
+```
+
+## Configuration Options
+
+### Proposal Expiry
+
+By default, proposals expire after 15 minutes (900 seconds):
+
+```kotlin
+val requestBody = ProposalRequest(
+    // ...
+    expiresInSeconds = 900,
+)
+```
+
+You can adjust this based on your use case:
+
+```kotlin
+// Quick checkout (5 minutes)
+expiresInSeconds = 300
+
+// Extended checkout (30 minutes)
+expiresInSeconds = 1800
+```
+
+### HTTP Client Timeout
+
+```kotlin
+private val client = OkHttpClient.Builder()
+    .connectTimeout(30, TimeUnit.SECONDS)
+    .readTimeout(30, TimeUnit.SECONDS)
+    .build()
+```
+
+## Testing
+
+### Test with Mock Payments
+
+For development, you can test without a real wallet:
+
+```bash
+# Create a test proposal
+curl -X POST http://localhost:8000/api/identipay/v1/proposals \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "items": [{"name": "Test Item", "quantity": 1, "unitPrice": "10.00", "currency": "USDC"}],
+    "amount": {"value": "10.00", "currency": "USDC"},
+    "deliverables": {"receipt": true},
+    "expiresInSeconds": 900
+  }'
+```
+
+## Troubleshooting
+
+### API Key Invalid
+
+```
+Proposal creation failed (401): Unauthorized
+```
+
+**Solution**: Verify your API key is correct and the merchant is registered.
+
+### Connection Timeout
+
+```
+Failed to connect to backend
+```
+
+**Solution**: Check network connectivity and verify the backend URL is correct.
+
+### Printer Not Connected
+
+```
+Failed to bind to printer service
+```
+
+**Solution**: Ensure the receipt printer service app is installed and running.
+
+## Requirements
+
+- **Android SDK**: 24+ (Android 7.0 Nougat)
+- **Target SDK**: 36
+- **Internet**: Required for backend communication
+- **NFC**: Optional, for tap-to-pay
+- **Printer**: Optional, for receipt printing
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Backend Setup" icon="server" href="/integration/backend-setup">
+    Set up the identiPay backend server
+  </Card>
+  <Card title="Merchant Registration" icon="store" href="/api-reference/merchants">
+    Learn about merchant registration
+  </Card>
+</CardGroup>

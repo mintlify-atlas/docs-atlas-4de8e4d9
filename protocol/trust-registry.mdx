@@ -1,0 +1,452 @@
+---
+title: "Trust Registry Contract"
+description: "On-chain registry of verified merchant identities and public keys"
+---
+
+## Overview
+
+The Trust Registry contract (`identipay::trust_registry`) maintains a shared on-chain database of verified merchants. Wallets query this registry to verify merchant legitimacy before signing payment intents.
+
+Per the whitepaper section 6, the registry stores each merchant's:
+- Decentralized Identifier (DID)
+- Human-readable name
+- Sui payment address
+- X25519 public key for ECDH encryption
+- Hostname for URI resolution
+- Active/inactive status
+
+## Source Code
+
+Location: `contracts/sources/trust_registry.move:5`
+
+## Data Structures
+
+### TrustRegistry
+
+Shared registry object holding all merchant records.
+
+<ParamField body="id" type="UID" required>
+  Sui object identifier
+</ParamField>
+
+<ParamField body="admin" type="address" required>
+  Admin address authorized to register merchants
+</ParamField>
+
+<ParamField body="merchants" type="Table<String, MerchantEntry>" required>
+  Maps DID to merchant entry
+</ParamField>
+
+```move
+public struct TrustRegistry has key {
+    id: UID,
+    admin: address,
+    merchants: Table<String, MerchantEntry>,
+}
+```
+
+### MerchantEntry
+
+Represents a registered merchant's verified identity.
+
+<ParamField body="did" type="String" required>
+  Decentralized Identifier (e.g., "did:identipay:shop.example.com:merchant123")
+</ParamField>
+
+<ParamField body="name" type="String" required>
+  Human-readable merchant name for wallet display
+</ParamField>
+
+<ParamField body="sui_address" type="address" required>
+  Merchant's Sui address for receiving payments
+</ParamField>
+
+<ParamField body="public_key" type="vector<u8>" required>
+  X25519 public key (32 bytes) for ECDH artifact encryption
+</ParamField>
+
+<ParamField body="hostname" type="String" required>
+  Merchant's hostname for URI resolution
+</ParamField>
+
+<ParamField body="active" type="bool" required>
+  Whether the merchant is currently active
+</ParamField>
+
+```move
+public struct MerchantEntry has store, copy, drop {
+    did: String,
+    name: String,
+    sui_address: address,
+    public_key: vector<u8>,
+    hostname: String,
+    active: bool,
+}
+```
+
+### Events
+
+#### MerchantRegistered
+
+Emitted when a new merchant is registered.
+
+<ResponseField name="did" type="String">
+  Merchant's DID
+</ResponseField>
+
+<ResponseField name="name" type="String">
+  Merchant's display name
+</ResponseField>
+
+<ResponseField name="sui_address" type="address">
+  Payment address
+</ResponseField>
+
+<ResponseField name="hostname" type="String">
+  Merchant's hostname
+</ResponseField>
+
+#### MerchantDeactivated
+
+Emitted when a merchant is deactivated.
+
+<ResponseField name="did" type="String">
+  Deactivated merchant's DID
+</ResponseField>
+
+## Entry Functions
+
+### register_merchant
+
+Register a new merchant in the trust registry. Only callable by admin.
+
+**Function Signature:**
+
+```move
+entry fun register_merchant(
+    registry: &mut TrustRegistry,
+    did: String,
+    name: String,
+    sui_address: address,
+    public_key: vector<u8>,
+    hostname: String,
+    ctx: &TxContext,
+)
+```
+
+<ParamField path="registry" type="&mut TrustRegistry" required>
+  Mutable reference to the trust registry
+</ParamField>
+
+<ParamField path="did" type="String" required>
+  Unique decentralized identifier for the merchant
+</ParamField>
+
+<ParamField path="name" type="String" required>
+  Human-readable merchant name
+</ParamField>
+
+<ParamField path="sui_address" type="address" required>
+  Merchant's Sui address for receiving payments
+</ParamField>
+
+<ParamField path="public_key" type="vector<u8>" required>
+  X25519 public key (must be exactly 32 bytes)
+</ParamField>
+
+<ParamField path="hostname" type="String" required>
+  Merchant's hostname
+</ParamField>
+
+**Errors:**
+
+- `ENotAdmin` (0): Caller is not the registry admin
+- `EEmptyDID` (4): DID is empty string
+- `EEmptyName` (5): Name is empty string
+- `EInvalidPublicKeyLength` (3): Public key is not 32 bytes
+- `EMerchantAlreadyExists` (1): DID already registered
+
+**Location:** `trust_registry.move:84-116`
+
+**Example:**
+
+<CodeGroup>
+
+```typescript TypeScript
+import { TransactionBlock } from '@mysten/sui.js/transactions';
+
+const tx = new TransactionBlock();
+
+tx.moveCall({
+  target: `${PACKAGE_ID}::trust_registry::register_merchant`,
+  arguments: [
+    tx.object(REGISTRY_ID),
+    tx.pure('did:identipay:shop.example.com:merchant123'),
+    tx.pure('Example Shop'),
+    tx.pure('0x1234...'), // merchant sui address
+    tx.pure(Array.from(publicKeyBytes)), // 32 bytes
+    tx.pure('shop.example.com'),
+  ],
+});
+
+// Admin signs and executes
+await adminWallet.signAndExecuteTransactionBlock({
+  transactionBlock: tx,
+});
+```
+
+```bash CLI
+sui client call \
+  --package $PACKAGE_ID \
+  --module trust_registry \
+  --function register_merchant \
+  --args \
+    $REGISTRY_ID \
+    '"did:identipay:shop.example.com:merchant123"' \
+    '"Example Shop"' \
+    '"0x1234..."' \
+    '[32 bytes of public key]' \
+    '"shop.example.com"' \
+  --gas-budget 10000000
+```
+
+</CodeGroup>
+
+### deactivate_merchant
+
+Deactivate a merchant (soft delete). Only callable by admin.
+
+**Function Signature:**
+
+```move
+entry fun deactivate_merchant(
+    registry: &mut TrustRegistry,
+    did: String,
+    ctx: &TxContext,
+)
+```
+
+<ParamField path="registry" type="&mut TrustRegistry" required>
+  Mutable reference to the trust registry
+</ParamField>
+
+<ParamField path="did" type="String" required>
+  DID of merchant to deactivate
+</ParamField>
+
+**Errors:**
+
+- `ENotAdmin` (0): Caller is not the registry admin
+- `EMerchantNotFound` (2): DID not found in registry
+
+**Location:** `trust_registry.move:119-131`
+
+### update_merchant_key
+
+Rotate a merchant's public key. Only callable by admin.
+
+**Function Signature:**
+
+```move
+entry fun update_merchant_key(
+    registry: &mut TrustRegistry,
+    did: String,
+    new_public_key: vector<u8>,
+    ctx: &TxContext,
+)
+```
+
+<ParamField path="registry" type="&mut TrustRegistry" required>
+  Mutable reference to the trust registry
+</ParamField>
+
+<ParamField path="did" type="String" required>
+  DID of merchant to update
+</ParamField>
+
+<ParamField path="new_public_key" type="vector<u8>" required>
+  New X25519 public key (must be exactly 32 bytes)
+</ParamField>
+
+**Errors:**
+
+- `ENotAdmin` (0): Caller is not the registry admin
+- `EInvalidPublicKeyLength` (3): Public key is not 32 bytes
+- `EMerchantNotFound` (2): DID not found in registry
+
+**Location:** `trust_registry.move:134-146`
+
+## Public Functions
+
+### lookup_merchant
+
+Look up a merchant by DID. Aborts if not found.
+
+```move
+public fun lookup_merchant(
+    registry: &TrustRegistry,
+    did: String
+): &MerchantEntry
+```
+
+<ParamField path="registry" type="&TrustRegistry" required>
+  Reference to the trust registry
+</ParamField>
+
+<ParamField path="did" type="String" required>
+  Merchant's DID
+</ParamField>
+
+<ResponseField name="entry" type="&MerchantEntry">
+  Reference to the merchant's entry
+</ResponseField>
+
+**Location:** `trust_registry.move:151-154`
+
+### is_merchant_active
+
+Check if a merchant exists and is active.
+
+```move
+public fun is_merchant_active(
+    registry: &TrustRegistry,
+    did: String
+): bool
+```
+
+<ParamField path="registry" type="&TrustRegistry" required>
+  Reference to the trust registry
+</ParamField>
+
+<ParamField path="did" type="String" required>
+  Merchant's DID
+</ParamField>
+
+<ResponseField name="active" type="bool">
+  Returns `true` if merchant exists and is active
+</ResponseField>
+
+**Location:** `trust_registry.move:157-163`
+
+### MerchantEntry Accessors
+
+The following functions extract fields from a `MerchantEntry`:
+
+```move
+public fun merchant_did(entry: &MerchantEntry): String
+public fun merchant_name(entry: &MerchantEntry): String
+public fun merchant_sui_address(entry: &MerchantEntry): address
+public fun merchant_public_key(entry: &MerchantEntry): vector<u8>
+public fun merchant_hostname(entry: &MerchantEntry): String
+public fun merchant_active(entry: &MerchantEntry): bool
+```
+
+**Location:** `trust_registry.move:167-172`
+
+## Usage Example
+
+<CodeGroup>
+
+```typescript Wallet Integration
+import { identiPayClient } from '@identipay/sdk';
+
+// User scans merchant QR code
+const proposal = await fetchProposal(qrCode);
+
+// Wallet verifies merchant is registered and active
+const merchant = await identiPayClient.lookupMerchant(
+  proposal.merchantDID
+);
+
+if (!merchant.active) {
+  throw new Error('Merchant is not active');
+}
+
+// Display merchant info to user
+showMerchantInfo({
+  name: merchant.name,
+  hostname: merchant.hostname,
+  did: merchant.did,
+});
+
+// User approves, wallet encrypts receipt using merchant.publicKey
+const sharedSecret = deriveECDH(
+  ephemeralPrivateKey,
+  merchant.publicKey
+);
+
+const encryptedReceipt = aesGcmEncrypt(
+  receiptPayload,
+  sharedSecret
+);
+
+// Proceed with settlement...
+```
+
+```typescript Merchant Onboarding
+import { generateKeyPair } from '@identipay/crypto';
+
+// Merchant generates X25519 keypair
+const { publicKey, privateKey } = generateKeyPair('x25519');
+
+// Merchant submits registration request to admin
+await submitRegistration({
+  did: 'did:identipay:myshop.com:merchant123',
+  name: 'My Shop',
+  sui_address: await wallet.getAddress(),
+  public_key: publicKey,
+  hostname: 'myshop.com',
+});
+
+// Admin reviews and registers on-chain
+// ... (see register_merchant example above)
+
+// Merchant stores private key securely
+await secureStorage.set('x25519_private_key', privateKey);
+```
+
+</CodeGroup>
+
+## Security Considerations
+
+<Warning>
+  **Admin Centralization**: The current implementation uses a single admin address. Production deployments should use a multisig or DAO for merchant registration decisions.
+</Warning>
+
+<Note>
+  **DID Format**: The DID format is not enforced on-chain. Off-chain systems should validate DID structure before registration.
+</Note>
+
+<Info>
+  **Key Rotation**: Merchants can rotate public keys via `update_merchant_key`. Wallets should fetch fresh merchant data before each transaction to ensure they use the latest key.
+</Info>
+
+<Warning>
+  **Deactivation vs Deletion**: Deactivated merchants remain in the registry with `active = false`. This preserves historical data while preventing new transactions.
+</Warning>
+
+## DID Format
+
+identiPay uses the following DID format:
+
+```
+did:identipay:<hostname>:<merchant-id>
+```
+
+**Examples:**
+- `did:identipay:shop.example.com:merchant123`
+- `did:identipay:acme.corp:store-sf-downtown`
+- `did:identipay:coffee.local:barista-alice`
+
+The DID serves as a globally unique identifier that resolves to on-chain merchant data.
+
+## Related Modules
+
+<CardGroup cols={2}>
+  <Card title="Settlement" icon="hand-holding-dollar" href="/protocol/settlement">
+    Uses merchant address for payment routing
+  </Card>
+  <Card title="Receipt" icon="receipt" href="/protocol/receipt">
+    Uses merchant public key for ECDH encryption
+  </Card>
+</CardGroup>

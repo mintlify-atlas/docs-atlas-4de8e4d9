@@ -1,0 +1,267 @@
+---
+title: 'Intents'
+description: 'Resolve payment proposals by transaction ID'
+---
+
+## Overview
+
+The intents endpoint allows wallets to resolve a proposal by transaction ID. This is used when a buyer scans a QR code or clicks a payment link.
+
+<Info>
+  This endpoint is public and does not require authentication.
+</Info>
+
+## Endpoints
+
+### Get Proposal by Transaction ID
+
+Resolve a proposal by its transaction ID.
+
+```http
+GET /api/identipay/v1/intents/:txId
+```
+
+Per the whitepaper (section 6), this endpoint is available at:
+```
+https://<hostname>/api/identipay/v1/intents/<transaction-id>
+```
+
+#### Path Parameters
+
+<ParamField path="txId" type="string" required>
+  Transaction ID (UUID) from the payment URI or QR code
+</ParamField>
+
+#### Response
+
+Returns the full CommerceProposal JSON-LD object (see [Proposals](/api/proposals) for schema).
+
+<ResponseField name="@context" type="string">
+  JSON-LD context (`https://schema.identipay.net/v1`)
+</ResponseField>
+
+<ResponseField name="@type" type="string">
+  Type (`CommerceProposal`)
+</ResponseField>
+
+<ResponseField name="transactionId" type="string">
+  UUID for this transaction
+</ResponseField>
+
+<ResponseField name="merchant" type="object">
+  Merchant information
+  
+  <Expandable title="Merchant Schema">
+    <ResponseField name="did" type="string">Merchant DID</ResponseField>
+    <ResponseField name="name" type="string">Merchant name</ResponseField>
+    <ResponseField name="suiAddress" type="string">Merchant Sui address</ResponseField>
+    <ResponseField name="publicKey" type="string">Merchant public key</ResponseField>
+  </Expandable>
+</ResponseField>
+
+<ResponseField name="items" type="array">
+  Array of line items
+</ResponseField>
+
+<ResponseField name="amount" type="object">
+  Total amount and currency
+</ResponseField>
+
+<ResponseField name="deliverables" type="object">
+  Receipt and warranty information
+</ResponseField>
+
+<ResponseField name="constraints" type="object">
+  Age gate or region restrictions
+</ResponseField>
+
+<ResponseField name="expiresAt" type="string">
+  ISO 8601 expiry timestamp
+</ResponseField>
+
+<ResponseField name="intentHash" type="string">
+  Hash for on-chain verification
+</ResponseField>
+
+<ResponseField name="settlementChain" type="string">
+  Blockchain name (`sui`)
+</ResponseField>
+
+<ResponseField name="settlementModule" type="string">
+  On-chain settlement module address
+</ResponseField>
+
+#### Example Request
+
+<CodeGroup>
+```bash cURL
+curl https://api.identipay.com/api/identipay/v1/intents/550e8400-e29b-41d4-a716-446655440000
+```
+
+```typescript TypeScript
+const txId = '550e8400-e29b-41d4-a716-446655440000';
+const response = await fetch(
+  `https://api.identipay.com/api/identipay/v1/intents/${txId}`
+);
+const proposal = await response.json();
+```
+</CodeGroup>
+
+#### Example Response
+
+```json
+{
+  "@context": "https://schema.identipay.net/v1",
+  "@type": "CommerceProposal",
+  "transactionId": "550e8400-e29b-41d4-a716-446655440000",
+  "merchant": {
+    "did": "did:identipay:acme.com:...",
+    "name": "Acme Store",
+    "suiAddress": "0xabc123...",
+    "publicKey": "a1b2c3d4..."
+  },
+  "items": [
+    {
+      "name": "Coffee",
+      "quantity": 2,
+      "unitPrice": "5.00"
+    }
+  ],
+  "amount": {
+    "value": "10.00",
+    "currency": "USDC"
+  },
+  "deliverables": {
+    "receipt": true,
+    "warranty": {
+      "durationDays": 30,
+      "transferable": false
+    }
+  },
+  "constraints": {
+    "ageGate": 21
+  },
+  "expiresAt": "2026-03-09T21:15:00.000Z",
+  "intentHash": "a1b2c3d4e5f6...",
+  "settlementChain": "sui",
+  "settlementModule": "0x123abc::settlement"
+}
+```
+
+#### Error Responses
+
+<Expandable title="404 Not Found">
+  Proposal with the specified transaction ID does not exist.
+  
+  ```json
+  {
+    "error": {
+      "code": "NOT_FOUND",
+      "message": "Proposal not found"
+    }
+  }
+  ```
+</Expandable>
+
+<Expandable title="400 Expired">
+  Proposal has expired.
+  
+  ```json
+  {
+    "error": {
+      "code": "VALIDATION_ERROR",
+      "message": "Proposal has expired"
+    }
+  }
+  ```
+  
+  When a proposal expires, the backend automatically updates its status to `expired`.
+</Expandable>
+
+<Expandable title="400 Cancelled">
+  Proposal has been cancelled.
+  
+  ```json
+  {
+    "error": {
+      "code": "VALIDATION_ERROR",
+      "message": "Proposal has been cancelled"
+    }
+  }
+  ```
+</Expandable>
+
+## Implementation Details
+
+### Resolution Flow
+
+When a wallet resolves an intent (see `routes/intents.ts:12-42`):
+
+1. **Lookup Proposal**: Query database by transaction ID
+2. **Check Existence**: Return 404 if not found
+3. **Check Expiry**: If expired, update status and return error
+4. **Check Status**: Return error if cancelled
+5. **Return Proposal**: Return full proposal JSON
+
+### Automatic Expiry Detection
+
+The endpoint checks expiry on every request:
+
+```typescript
+if (new Date(proposal.expiresAt) < new Date()) {
+  if (proposal.status === "pending") {
+    await db
+      .update(proposals)
+      .set({ status: "expired" })
+      .where(eq(proposals.transactionId, txId));
+  }
+  throw new ValidationError("Proposal has expired");
+}
+```
+
+This ensures proposals cannot be settled after expiry, even if the background expiry task hasn't run yet.
+
+### Payment URI Format
+
+Wallets typically extract the transaction ID from a payment URI:
+
+```
+identipay://{merchant-hostname}/{transaction-id}
+```
+
+Example:
+```
+identipay://acme.com/550e8400-e29b-41d4-a716-446655440000
+```
+
+The wallet:
+1. Extracts the hostname (`acme.com`)
+2. Extracts the transaction ID (`550e8400-...`)
+3. Constructs the intent URL: `https://acme.com/api/identipay/v1/intents/550e8400-...`
+4. Fetches the proposal
+5. Displays it to the user for approval
+
+### Privacy Considerations
+
+The proposal includes the merchant's Sui address and public key, but:
+- Does NOT include the buyer's information (added during settlement)
+- Does NOT reveal which addresses are scanning the proposal
+- Can be fetched anonymously (no authentication required)
+
+### Settlement Workflow
+
+After resolving the proposal, the wallet:
+
+1. **Display Proposal**: Show merchant, items, amount, constraints
+2. **Check Constraints**: Verify age gate (generate ZK proof if needed)
+3. **Build Settlement**: Create settlement transaction via `/transactions/gas-sponsor`
+4. **Sign & Submit**: Sign transaction and submit via `/transactions/submit`
+5. **Monitor Status**: Watch for settlement confirmation via WebSocket
+
+See [Transactions](/api/transactions) for settlement details.
+
+## Related Endpoints
+
+- [Proposals](/api/proposals) - Create proposals (merchant endpoint)
+- [Transactions](/api/transactions) - Submit settlements
+- [WebSocket](/api/websocket) - Monitor settlement status

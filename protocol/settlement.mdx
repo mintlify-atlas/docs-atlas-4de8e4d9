@@ -1,0 +1,400 @@
+---
+title: "Settlement Contract"
+description: "Atomic commerce execution orchestrator for identiPay transactions"
+---
+
+## Overview
+
+The Settlement contract (`identipay::settlement`) is the core orchestrator for identiPay transactions. It implements atomic execution of commerce settlements, ensuring all operations succeed or fail together.
+
+Per the whitepaper (section 5), the settlement uses Programmable Transaction Blocks (PTBs) to atomically:
+1. Verify ZK eligibility proofs (if age-gated)
+2. Verify buyer's intent signature
+3. Transfer payment to merchant
+4. Mint encrypted receipt to buyer's stealth address
+5. Optionally mint warranty
+6. Emit settlement event
+
+## Source Code
+
+Location: `contracts/sources/settlement.move:12`
+
+## Data Structures
+
+### SettlementState
+
+Shared state for settlement replay protection.
+
+<ParamField body="id" type="UID" required>
+  Sui object identifier
+</ParamField>
+
+<ParamField body="executed_intents" type="Table<vector<u8>, bool>" required>
+  Maps intent hash to execution status. Prevents replay of signed intents.
+</ParamField>
+
+```move
+public struct SettlementState has key {
+    id: UID,
+    executed_intents: Table<vector<u8>, bool>,
+}
+```
+
+### SettlementEvent
+
+Emitted on successful settlement. Indexed by intent hash, not buyer identity.
+
+<ResponseField name="intent_hash" type="vector<u8>">
+  SHA3-256 hash of the canonicalized intent
+</ResponseField>
+
+<ResponseField name="merchant" type="address">
+  Merchant's Sui address receiving payment
+</ResponseField>
+
+<ResponseField name="amount" type="u64">
+  Payment amount in smallest token units
+</ResponseField>
+
+<ResponseField name="receipt_id" type="ID">
+  Object ID of the minted receipt
+</ResponseField>
+
+<ResponseField name="warranty_id" type="Option<ID>">
+  Optional warranty object ID
+</ResponseField>
+
+<ResponseField name="buyer_stealth_address" type="address">
+  One-time stealth address where artifacts were delivered
+</ResponseField>
+
+```move
+public struct SettlementEvent has copy, drop {
+    intent_hash: vector<u8>,
+    merchant: address,
+    amount: u64,
+    receipt_id: ID,
+    warranty_id: Option<ID>,
+    buyer_stealth_address: address,
+}
+```
+
+## Entry Functions
+
+### execute_commerce
+
+Execute a full commerce settlement atomically with ZK proof verification.
+
+**Function Signature:**
+
+```move
+entry fun execute_commerce<T>(
+    state: &mut SettlementState,
+    payment: &mut Coin<T>,
+    amount: u64,
+    merchant: address,
+    buyer_stealth_addr: address,
+    intent_sig: vector<u8>,
+    intent_hash: vector<u8>,
+    buyer_pubkey: vector<u8>,
+    proposal_expiry: u64,
+    zk_vk: &VerificationKey,
+    zk_proof: vector<u8>,
+    zk_public_inputs: vector<u8>,
+    encrypted_payload: vector<u8>,
+    payload_nonce: vector<u8>,
+    ephemeral_pubkey: vector<u8>,
+    encrypted_warranty_terms: vector<u8>,
+    warranty_terms_nonce: vector<u8>,
+    warranty_expiry: u64,
+    warranty_transferable: bool,
+    ctx: &mut TxContext,
+)
+```
+
+<ParamField path="state" type="&mut SettlementState" required>
+  Mutable reference to the shared settlement state
+</ParamField>
+
+<ParamField path="payment" type="&mut Coin<T>" required>
+  Coin to split payment from. Change remains with sender.
+</ParamField>
+
+<ParamField path="amount" type="u64" required>
+  Payment amount to transfer to merchant
+</ParamField>
+
+<ParamField path="merchant" type="address" required>
+  Merchant's Sui address for payment delivery
+</ParamField>
+
+<ParamField path="buyer_stealth_addr" type="address" required>
+  One-time stealth address for receipt/warranty delivery
+</ParamField>
+
+<ParamField path="intent_sig" type="vector<u8>" required>
+  Ed25519 signature (64 bytes) over intent_hash
+</ParamField>
+
+<ParamField path="intent_hash" type="vector<u8>" required>
+  SHA3-256 hash of canonicalized commerce proposal
+</ParamField>
+
+<ParamField path="buyer_pubkey" type="vector<u8>" required>
+  Buyer's Ed25519 public key (32 bytes)
+</ParamField>
+
+<ParamField path="proposal_expiry" type="u64" required>
+  Proposal expiration timestamp (epoch ms). Must be in the future.
+</ParamField>
+
+<ParamField path="zk_vk" type="&VerificationKey" required>
+  ZK verification key for eligibility proof
+</ParamField>
+
+<ParamField path="zk_proof" type="vector<u8>" required>
+  Groth16 proof bytes
+</ParamField>
+
+<ParamField path="zk_public_inputs" type="vector<u8>" required>
+  Public inputs for ZK circuit
+</ParamField>
+
+<ParamField path="encrypted_payload" type="vector<u8>" required>
+  AES-256-GCM encrypted receipt payload
+</ParamField>
+
+<ParamField path="payload_nonce" type="vector<u8>" required>
+  12-byte GCM nonce for receipt decryption
+</ParamField>
+
+<ParamField path="ephemeral_pubkey" type="vector<u8>" required>
+  Ephemeral X25519 public key (32 bytes) for ECDH
+</ParamField>
+
+<ParamField path="encrypted_warranty_terms" type="vector<u8>">
+  Encrypted warranty terms. Pass empty vector if no warranty.
+</ParamField>
+
+<ParamField path="warranty_terms_nonce" type="vector<u8>">
+  12-byte GCM nonce for warranty decryption
+</ParamField>
+
+<ParamField path="warranty_expiry" type="u64">
+  Warranty expiration timestamp (epoch ms)
+</ParamField>
+
+<ParamField path="warranty_transferable" type="bool">
+  Whether warranty can be transferred
+</ParamField>
+
+**Errors:**
+
+- `EInvalidAmount` (0): Amount is zero or exceeds payment coin value
+- `EProposalExpired` (1): Current time exceeds proposal_expiry
+- `EIntentAlreadyExecuted` (2): Intent hash was already settled
+
+**Location:** `settlement.move:77-167`
+
+### execute_commerce_no_zk
+
+Execute a commerce settlement without ZK proof verification. For transactions without age gates or other constraints.
+
+**Function Signature:**
+
+```move
+entry fun execute_commerce_no_zk<T>(
+    state: &mut SettlementState,
+    payment: &mut Coin<T>,
+    amount: u64,
+    merchant: address,
+    buyer_stealth_addr: address,
+    intent_sig: vector<u8>,
+    intent_hash: vector<u8>,
+    buyer_pubkey: vector<u8>,
+    proposal_expiry: u64,
+    encrypted_payload: vector<u8>,
+    payload_nonce: vector<u8>,
+    ephemeral_pubkey: vector<u8>,
+    encrypted_warranty_terms: vector<u8>,
+    warranty_terms_nonce: vector<u8>,
+    warranty_expiry: u64,
+    warranty_transferable: bool,
+    ctx: &mut TxContext,
+)
+```
+
+Parameters are identical to `execute_commerce` except ZK-related parameters are omitted.
+
+**Location:** `settlement.move:171-248`
+
+## Public Functions
+
+### is_intent_executed
+
+Check if an intent hash has already been executed.
+
+```move
+public fun is_intent_executed(
+    state: &SettlementState,
+    intent_hash: vector<u8>
+): bool
+```
+
+<ParamField path="state" type="&SettlementState" required>
+  Reference to settlement state
+</ParamField>
+
+<ParamField path="intent_hash" type="vector<u8>" required>
+  Intent hash to check
+</ParamField>
+
+<ResponseField name="result" type="bool">
+  Returns `true` if intent was already executed
+</ResponseField>
+
+**Location:** `settlement.move:253-255`
+
+## Usage Example
+
+<CodeGroup>
+
+```typescript TypeScript SDK
+import { TransactionBlock } from '@mysten/sui.js/transactions';
+import { identiPayClient } from '@identipay/sdk';
+
+// Buyer wallet constructs settlement PTB
+const tx = new TransactionBlock();
+
+// Prepare intent signature
+const intentHash = await computeIntentHash(proposal);
+const intentSig = await wallet.signIntent(intentHash);
+
+// Generate stealth address
+const stealthAddr = await deriveStealthAddress(
+  merchantMetaAddress,
+  ephemeralPrivateKey
+);
+
+// Encrypt receipt payload
+const { ciphertext, nonce } = await encryptPayload(
+  receiptData,
+  merchantPublicKey,
+  ephemeralPrivateKey
+);
+
+// Call settlement
+tx.moveCall({
+  target: `${PACKAGE_ID}::settlement::execute_commerce`,
+  typeArguments: [USDC_TYPE],
+  arguments: [
+    tx.object(SETTLEMENT_STATE_ID),
+    tx.object(paymentCoinId),
+    tx.pure(amount),
+    tx.pure(merchantAddress),
+    tx.pure(stealthAddr),
+    tx.pure(intentSig),
+    tx.pure(intentHash),
+    tx.pure(buyerPublicKey),
+    tx.pure(proposalExpiry),
+    tx.object(zkVerificationKeyId),
+    tx.pure(zkProof),
+    tx.pure(zkPublicInputs),
+    tx.pure(ciphertext),
+    tx.pure(nonce),
+    tx.pure(ephemeralPubkey),
+    tx.pure([]), // no warranty
+    tx.pure([]),
+    tx.pure(0),
+    tx.pure(false),
+  ],
+});
+
+const result = await wallet.signAndExecuteTransactionBlock({
+  transactionBlock: tx,
+});
+```
+
+```move Move Test
+use identipay::settlement;
+use sui::test_scenario;
+
+#[test]
+fun test_settlement() {
+    let user = @0x1;
+    let merchant = @0x2;
+    
+    let mut scenario = test_scenario::begin(user);
+    
+    // Initialize settlement state
+    {
+        let ctx = scenario.ctx();
+        settlement::init_for_testing(ctx);
+    };
+    
+    // Execute settlement (simplified)
+    scenario.next_tx(user);
+    {
+        let mut state = scenario.take_shared<SettlementState>();
+        let mut coin = coin::mint_for_testing<SUI>(1000, scenario.ctx());
+        
+        settlement::execute_commerce_no_zk(
+            &mut state,
+            &mut coin,
+            1000,
+            merchant,
+            @0x3, // stealth address
+            intent_sig,
+            intent_hash,
+            buyer_pubkey,
+            1000000,
+            encrypted_payload,
+            nonce,
+            ephemeral_pubkey,
+            vector[],
+            vector[],
+            0,
+            false,
+            scenario.ctx(),
+        );
+        
+        test_scenario::return_shared(state);
+        coin::destroy_for_testing(coin);
+    };
+    
+    scenario.end();
+}
+```
+
+</CodeGroup>
+
+## Security Considerations
+
+<Warning>
+  **Replay Protection**: The contract stores executed intent hashes indefinitely. In production, consider implementing a time-based cleanup mechanism for very old intents to manage storage costs.
+</Warning>
+
+<Note>
+  **Atomicity**: All operations execute in a single PTB. If any step fails (ZK proof invalid, signature invalid, insufficient balance), the entire transaction reverts with no state changes.
+</Note>
+
+<Info>
+  **Generic Tokens**: The contract is generic over `<T>` and works with any Sui coin type. Most deployments use `Coin<USDC>` on testnet.
+</Info>
+
+## Related Modules
+
+<CardGroup cols={2}>
+  <Card title="Intent" icon="signature" href="/protocol/intent">
+    Signature verification logic
+  </Card>
+  <Card title="Receipt" icon="receipt" href="/protocol/receipt">
+    Receipt minting and structure
+  </Card>
+  <Card title="Warranty" icon="shield-check" href="/protocol/warranty">
+    Warranty minting and transfers
+  </Card>
+  <Card title="ZK Verifier" icon="lock" href="/protocol/zk-verifier">
+    Groth16 proof verification
+  </Card>
+</CardGroup>

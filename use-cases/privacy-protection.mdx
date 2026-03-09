@@ -1,0 +1,694 @@
+---
+title: Privacy Protection
+description: Stealth addresses and shielded pools for transaction unlinkability
+icon: eye-slash
+---
+
+identiPay provides strong privacy guarantees through **stealth addresses** and **shielded pools**. These cryptographic primitives ensure that transactions cannot be linked to users' public identities or to each other.
+
+## Privacy Architecture
+
+identiPay uses a two-layer privacy system:
+
+<CardGroup cols={2}>
+  <Card title="Stealth Addresses (Layer 1)" icon="mask">
+    One-time addresses derived using ECDH, preventing address reuse and transaction linking.
+  </Card>
+  
+  <Card title="Shielded Pool (Layer 2)" icon="water">
+    Zero-knowledge asset pool using Merkle tree commitments, enabling untraceable fund mixing.
+  </Card>
+</CardGroup>
+
+### Privacy Guarantees
+
+| Property | Without identiPay | With Stealth Addresses | With Shielded Pool |
+|----------|-------------------|------------------------|--------------------|
+| Address reuse | ✗ Same address for all transactions | ✓ New address per transaction | ✓ Pool deposit/withdraw addresses |
+| Transaction linking | ✗ All txs publicly linked | ✓ Txs not linkable by address | ✓✓ Txs not linkable at all |
+| Balance privacy | ✗ Balance publicly visible | ~ Balance per address visible | ✓ Pool balance hidden |
+| Recipient privacy | ✗ Recipient known | ✓ Recipient uses one-time address | ✓ Recipient gets mixed funds |
+
+## Stealth Addresses
+
+Stealth addresses enable **one-time addresses** for every transaction. The sender derives a unique address for the recipient, and only the recipient can scan the blockchain to detect funds sent to them.
+
+### How Stealth Addresses Work
+
+Each user has two key pairs:
+
+- **Spend keypair** (Ed25519): Used to spend funds from stealth addresses
+- **View keypair** (X25519): Used to scan the blockchain for incoming funds
+
+The user publishes their **meta-address** (public keys only):
+
+```json
+{
+  "name": "alice.identipay",
+  "spendPubkey": "0x1a2b3c...",  // Ed25519 public key
+  "viewPubkey": "0x4d5e6f..."    // X25519 public key
+}
+```
+
+### Sending to a Stealth Address
+
+When Bob wants to send funds to Alice, he:
+
+1. **Generates an ephemeral X25519 keypair** (r, R = r·G)
+2. **Computes ECDH shared secret**: shared = x25519(r, Alice_viewPubkey)
+3. **Derives stealth scalar**: s = SHA-256(shared || "identipay-stealth-v1")
+4. **Computes stealth public key**: K_stealth = Alice_spendPubkey + s·G (Ed25519 point addition)
+5. **Derives Sui address**: addr = BLAKE2b-256(0x00 || K_stealth)
+6. **Extracts view tag**: first byte of shared secret (0-255)
+
+Bob sends funds to `addr` and publishes an **announcement**:
+
+```json
+{
+  "ephemeralPubkey": "0x...",  // R (32 bytes)
+  "stealthAddress": "0x...",   // Derived Sui address
+  "viewTag": 42                // 0-255
+}
+```
+
+### Receiving from a Stealth Address
+
+Alice scans announcement events to find funds sent to her:
+
+```typescript
+// From stealth.service.ts:116-136
+
+export function scanAnnouncement(
+  viewPrivateKey: Uint8Array,
+  spendPubkey: Uint8Array,
+  ephemeralPubkey: Uint8Array,
+  announcedViewTag: number,
+  announcedStealthAddress: string,
+): boolean {
+  // 1. Compute ECDH shared secret
+  const shared = ecdhSharedSecret(viewPrivateKey, ephemeralPubkey);
+  const viewTag = extractViewTag(shared);
+
+  // 2. Fast filter: check view tag first (256x speedup)
+  if (viewTag !== announcedViewTag) return false;
+
+  // 3. Full derivation to confirm
+  const scalar = deriveStealthScalar(shared);
+  const stealthPubkey = computeStealthPubkey(spendPubkey, scalar);
+  const stealthAddress = pubkeyToSuiAddress(stealthPubkey);
+
+  return stealthAddress === announcedStealthAddress;
+}
+```
+
+<Steps>
+  <Step title="Compute shared secret">
+    Alice uses her view private key and Bob's ephemeral public key: `shared = x25519(k_view, R)`
+  </Step>
+  
+  <Step title="Check view tag">
+    The view tag is the first byte of the shared secret. If it doesn't match, skip this announcement (256x speedup).
+  </Step>
+  
+  <Step title="Derive stealth key">
+    Compute the stealth scalar and public key, then derive the Sui address.
+  </Step>
+  
+  <Step title="Compare addresses">
+    If the derived address matches the announced address, the funds are for Alice.
+  </Step>
+</Steps>
+
+### Spending from a Stealth Address
+
+To spend funds from a stealth address, Alice computes the **stealth private key**:
+
+```
+k_stealth = k_spend + s (scalar addition)
+```
+
+Where:
+- `k_spend` is Alice's spend private key (32-byte scalar)
+- `s` is the stealth scalar derived from the shared secret
+
+She signs the transaction with `k_stealth` and submits it to the blockchain.
+
+```kotlin
+// From StealthAddress.kt
+
+fun scan(
+    viewPrivateKey: ByteArray,
+    spendPrivateKey: ByteArray,
+    spendPubkey: ByteArray,
+    ephemeralPubkey: ByteArray,
+    announcedViewTag: Int,
+    announcedStealthAddress: String,
+): ScanResult? {
+    // 1. Compute ECDH shared secret
+    val shared = x25519.getSharedSecret(viewPrivateKey, ephemeralPubkey)
+    val viewTag = shared[0].toInt() and 0xFF
+    
+    // 2. Fast filter: check view tag
+    if (viewTag != announcedViewTag) return null
+    
+    // 3. Derive stealth scalar
+    val scalar = sha256(shared + "identipay-stealth-v1".toByteArray())
+    
+    // 4. Compute stealth private key = k_spend + s
+    val stealthPrivateKey = scalarAdd(spendPrivateKey, scalar)
+    
+    // 5. Verify the address matches
+    val stealthPubkey = ed25519.getPublicKey(stealthPrivateKey)
+    val stealthAddress = blake2b(0x00 || stealthPubkey)
+    
+    if (stealthAddress == announcedStealthAddress) {
+        return ScanResult(
+            stealthAddress = stealthAddress,
+            stealthPrivateKey = stealthPrivateKey,
+            stealthPubkey = stealthPubkey,
+        )
+    }
+    
+    return null
+}
+```
+
+<Warning>
+**Key Security:** The stealth private key is derived deterministically from the spend key and shared secret. It is stored encrypted in the wallet database, never transmitted over the network.
+</Warning>
+
+### View Tags: 256x Scanning Speedup
+
+The **view tag** is a 1-byte value (0-255) derived from the first byte of the ECDH shared secret. It provides a fast filter for scanning:
+
+- **Without view tags:** Alice must compute full ECDH + scalar derivation for every announcement (~1000 hashes per announcement)
+- **With view tags:** Alice checks the view tag first (single byte comparison), only doing full derivation if it matches (256x fewer computations on average)
+
+```
+Example: 1 million announcements per day
+
+Without view tags: 
+  1,000,000 announcements × 1000 hashes = 1 billion hashes/day
+
+With view tags:
+  1,000,000 announcements × 1 byte check = 1 million checks
+  + 1,000,000 / 256 matches × 1000 hashes = ~4 million hashes/day
+  = 250x faster scanning
+```
+
+## Shielded Pool
+
+The shielded pool provides **Layer 2 privacy** by enabling untraceable fund mixing. Users deposit USDC into the pool and receive cryptographic note commitments. They can later withdraw to fresh addresses with zero-knowledge proofs.
+
+### Pool Architecture
+
+The pool is implemented as a Sui smart contract with:
+
+- **Merkle tree** (depth 20) storing note commitments
+- **Nullifier set** preventing double-spending
+- **Deposit function** accepting USDC and inserting commitments
+- **Withdraw function** verifying ZK proofs and transferring USDC
+
+```
+┌─────────────────────────────────────────────┐
+│         Shielded Pool Contract              │
+│                                             │
+│  Merkle Tree (depth 20)                     │
+│  ├─ Commitment 0: Poseidon(amt, key, salt) │
+│  ├─ Commitment 1: Poseidon(amt, key, salt) │
+│  ├─ Commitment 2: Poseidon(amt, key, salt) │
+│  └─ ...                                     │
+│                                             │
+│  Nullifier Set: {nul_0, nul_1, ...}         │
+│  Current Root: 0x3a7f8c9e...                │
+└─────────────────────────────────────────────┘
+```
+
+### Depositing into the Pool
+
+When Alice deposits USDC into the pool:
+
+1. **Generate random salt** (31 bytes to stay within BN254 field)
+2. **Compute note commitment**: `commitment = Poseidon(amount, ownerKey, salt)`
+3. **Submit deposit transaction**: Transfer USDC to pool, insert commitment into Merkle tree
+4. **Store note locally**: Save `(commitment, amount, ownerKey, salt, leafIndex)` in encrypted database
+
+```kotlin
+// From PoolRepository.kt:74-155
+
+suspend fun deposit(
+    amount: Long,
+    stealthAddress: String,
+    stealthPrivKey: ByteArray,
+): PoolResult {
+    // 1. Generate random salt
+    val saltBytes = ByteArray(31)
+    SecureRandom().nextBytes(saltBytes)
+    val salt = BigInteger(1, saltBytes).mod(PoseidonHash.FIELD_PRIME)
+
+    // 2. Compute owner key (public key from stealth private key)
+    val ownerPubkey = Ed25519Ops.publicKeyFromScalar(stealthPrivKey)
+    val ownerKeyField = BigInteger(1, ownerPubkey).mod(PoseidonHash.FIELD_PRIME)
+
+    // 3. Compute note commitment = Poseidon(amount, ownerKey, salt)
+    val amountField = BigInteger.valueOf(amount)
+    val noteCommitment = PoseidonHash.hash3(amountField, ownerKeyField, salt)
+
+    // 4. Build deposit transaction via gas sponsorship
+    val txDigest = executePoolDeposit(
+        senderAddress = stealthAddress,
+        senderPrivKey = stealthPrivKey,
+        amount = amount,
+        noteCommitment = noteCommitment,
+    )
+
+    // 5. Get leaf index from deposit event (retry until indexed)
+    var leafIndex: Long? = null
+    for (attempt in 0 until 10) {
+        leafIndex = fetchDepositLeafIndex(txDigest)
+        if (leafIndex != null) break
+        delay(1500L)
+    }
+
+    // 6. Compute nullifier = Poseidon(noteCommitment, ownerKeyField)
+    val nullifier = PoseidonHash.hash2(noteCommitment, ownerKeyField)
+
+    // 7. Store note locally
+    val noteId = noteDao.insert(
+        NoteEntity(
+            noteCommitment = noteCommitment.toString(16),
+            amount = amount,
+            ownerKey = ownerPubkey.toHexString(),
+            salt = salt.toString(16),
+            leafIndex = leafIndex,
+            depositTxDigest = txDigest,
+        )
+    )
+
+    return PoolResult.Success(txDigest, noteId = noteId)
+}
+```
+
+<Note>
+**Privacy preservation:** The deposit transaction reveals the sender address and amount, but subsequent withdrawals are unlinkable because they use zero-knowledge proofs of Merkle tree membership.
+</Note>
+
+### Withdrawing from the Pool
+
+To withdraw from the pool without revealing which note is being spent:
+
+<Steps>
+  <Step title="Fetch Merkle proof">
+    Reconstruct the Merkle tree by replaying all deposit events, then extract the sibling path for the note's leaf index.
+  </Step>
+  
+  <Step title="Compute nullifier">
+    `nullifier = Poseidon(noteCommitment, ownerKey)`. This prevents double-spending.
+  </Step>
+  
+  <Step title="Generate ZK proof">
+    Prove in zero-knowledge: "I know a note commitment in the Merkle tree with this nullifier, and I am withdrawing an amount ≤ the note amount."
+  </Step>
+  
+  <Step title="Submit withdraw transaction">
+    The contract verifies the proof, checks the nullifier is unused, marks it as spent, and transfers USDC to the recipient.
+  </Step>
+</Steps>
+
+```kotlin
+// From PoolRepository.kt:166-288
+
+suspend fun withdraw(
+    noteId: Long,
+    recipientAddress: String,
+    amount: Long,
+): PoolResult {
+    val note = noteDao.getById(noteId)
+    
+    // 1. Reconstruct note fields
+    val noteCommitment = BigInteger(note.noteCommitment, 16)
+    val ownerKeyBytes = hexToBytes(note.ownerKey)
+    val ownerKeyField = BigInteger(1, ownerKeyBytes).mod(PoseidonHash.FIELD_PRIME)
+    val salt = BigInteger(note.salt, 16)
+
+    // 2. Compute nullifier
+    val nullifier = PoseidonHash.hash2(noteCommitment, ownerKeyField)
+
+    // 3. Get Merkle proof + root (retry until synced)
+    val (merklePath, merkleRoot) = run {
+        for (attempt in 0 until 10) {
+            val onChainRoot = fetchMerkleRoot()
+            val (path, computedRoot) = getMerkleProofAndRoot(note.leafIndex)
+            if (computedRoot == onChainRoot) {
+                return@run Pair(path, onChainRoot)
+            }
+            delay(2000L)
+        }
+        return PoolResult.Error("Merkle tree not synced after retries")
+    }
+
+    // 4. Compute change commitment (if partial withdrawal)
+    val changeAmount = note.amount - amount
+    var changeCommitment = BigInteger.ZERO
+    if (changeAmount > 0) {
+        val changeSaltBytes = ByteArray(31)
+        SecureRandom().nextBytes(changeSaltBytes)
+        val changeSalt = BigInteger(1, changeSaltBytes).mod(PoseidonHash.FIELD_PRIME)
+        changeCommitment = PoseidonHash.hash3(
+            BigInteger.valueOf(changeAmount),
+            ownerKeyField,
+            changeSalt,
+        )
+    }
+
+    // 5. Build circuit input
+    val pathIndices = computePathIndices(note.leafIndex, TREE_DEPTH)
+    val poolSpendInput = PoolSpendInput(
+        noteAmount = note.amount.toString(),
+        ownerKey = ownerKeyField.toString(),
+        salt = salt.toString(),
+        pathElements = merklePath.map { it.toString() },
+        pathIndices = pathIndices.map { it.toString() },
+        merkleRoot = merkleRoot.toString(),
+        nullifier = nullifier.toString(),
+        withdrawAmount = amount.toString(),
+        recipient = addressToField(recipientAddress).toString(),
+        changeCommitment = changeCommitment.toString(),
+    )
+
+    // 6. Generate ZK proof
+    val proofResult = proofGenerator.generatePoolProof(poolSpendInput)
+
+    // 7. Build and submit withdraw transaction
+    val txDigest = executePoolWithdraw(
+        nullifier = nullifier,
+        recipient = recipientAddress,
+        amount = amount,
+        changeCommitment = changeCommitment,
+        proof = proofResult.proofBytes,
+        publicInputs = proofResult.publicInputsBytes,
+    )
+
+    // 8. Mark note as spent
+    noteDao.markSpent(noteId, nullifier.toString(16), txDigest)
+
+    return PoolResult.Success(txDigest)
+}
+```
+
+### The pool_spend Circuit
+
+The `pool_spend` circuit (~35K constraints) proves:
+
+> "I know a note commitment in the Merkle tree with amount A and owner key K, and I am withdrawing W ≤ A to recipient R, with nullifier N and change commitment C."
+
+**Public inputs:**
+- `merkleRoot`: Current Merkle tree root
+- `nullifier`: Prevents double-spending
+- `recipient`: Destination address
+- `withdrawAmount`: Amount being withdrawn
+- `changeCommitment`: Commitment to remaining change (or 0)
+
+**Private inputs:**
+- `noteAmount`: Amount in the note
+- `ownerKey`: Owner's secret key
+- `salt`: Randomness used when creating the note
+- `pathElements[20]`: Merkle proof sibling hashes
+- `pathIndices[20]`: Merkle proof directions (0=left, 1=right)
+
+```circom
+// From circuits/pool_spend.circom:74-178
+
+template PoolSpend(depth) {
+    // Private inputs
+    signal input noteAmount;
+    signal input ownerKey;
+    signal input salt;
+    signal input pathElements[depth];
+    signal input pathIndices[depth];
+
+    // Public inputs
+    signal input merkleRoot;
+    signal input nullifier;
+    signal input recipient;
+    signal input withdrawAmount;
+    signal input changeCommitment;
+
+    // 1. Compute note commitment = Poseidon(noteAmount, ownerKey, salt)
+    component commitHasher = Poseidon(3);
+    commitHasher.inputs[0] <== noteAmount;
+    commitHasher.inputs[1] <== ownerKey;
+    commitHasher.inputs[2] <== salt;
+    signal commitment;
+    commitment <== commitHasher.out;
+
+    // 2. Verify Merkle proof: commitment is in the tree with merkleRoot
+    component merkleProof = MerkleProof(depth);
+    merkleProof.leaf <== commitment;
+    for (var i = 0; i < depth; i++) {
+        merkleProof.pathElements[i] <== pathElements[i];
+        merkleProof.pathIndices[i] <== pathIndices[i];
+    }
+    merkleProof.root === merkleRoot;
+
+    // 3. Compute nullifier = Poseidon(commitment, ownerKey)
+    component nullifierHasher = Poseidon(2);
+    nullifierHasher.inputs[0] <== commitment;
+    nullifierHasher.inputs[1] <== ownerKey;
+    nullifierHasher.out === nullifier;
+
+    // 4. Range check: withdrawAmount <= noteAmount
+    signal changeAmount;
+    changeAmount <== noteAmount - withdrawAmount;
+    component changeRangeCheck = Num2Bits(64);
+    changeRangeCheck.in <== changeAmount;
+
+    // 5. Change commitment validation
+    component isChangeZero = IsZero();
+    isChangeZero.in <== changeAmount;
+    signal zeroCheck;
+    zeroCheck <== isChangeZero.out * changeCommitment;
+    zeroCheck === 0;
+
+    // 6. Bind recipient to the proof
+    signal recipientSquared;
+    recipientSquared <== recipient * recipient;
+}
+```
+
+<Accordion title="Why is the Merkle tree depth 20?">
+A depth-20 Merkle tree supports 2^20 = 1,048,576 notes. This is sufficient for:
+- ~1000 deposits per day for 3 years
+- ~10,000 deposits per day for 100 days
+- ~100,000 deposits per day for 10 days
+
+Increasing depth increases proof generation time (each additional level adds ~100ms on mobile). Depth 20 balances capacity with performance.
+</Accordion>
+
+### Pool-on-Merge: Automatic Privacy
+
+The wallet automatically uses the pool when a payment requires more USDC than any single stealth address holds:
+
+```kotlin
+// From CommerceRepository.kt:146-219
+
+val amountMicros = parseAmountMicros(proposal.amount.value)
+val sources = stealthAddressDao.getWithBalance()
+var source = sources.firstOrNull { it.balanceUsdc >= amountMicros }
+
+// Pool-on-merge: deposit into shielded pool, then withdraw to a fresh address
+if (source == null) {
+    val totalBalance = sources.sumOf { it.balanceUsdc }
+    if (totalBalance < amountMicros) {
+        return CommerceResult.Error("Insufficient USDC balance")
+    }
+
+    // 1. Deposit all sources into the pool
+    val depositedNoteIds = mutableListOf<Long>()
+    for (src in sources) {
+        if (src.balanceUsdc <= 0) continue
+        val result = poolRepository.get().deposit(
+            src.balanceUsdc, src.stealthAddress, privKey,
+        )
+        depositedNoteIds.add((result as PoolResult.Success).noteId)
+        stealthAddressDao.updateBalance(src.stealthAddress, 0)
+    }
+
+    // 2. Derive a fresh stealth address for withdrawal
+    val mergeSpendPub = walletKeys.getSpendPublicKey()
+    val mergeViewPub = walletKeys.getViewPublicKey()
+    val mergeStealth = stealthAddress.derive(mergeSpendPub, mergeViewPub)
+    val mergeScan = stealthAddress.scan(...)
+    stealthAddressDao.insert(mergeStealth)
+
+    // 3. Withdraw only the just-deposited notes to the fresh address
+    val depositedNotes = poolRepository.get().getNotesByIds(depositedNoteIds)
+    for (note in depositedNotes) {
+        val result = poolRepository.get().withdraw(
+            noteId = note.id,
+            recipientAddress = mergeScan.stealthAddress,
+            amount = note.amount,
+        )
+    }
+
+    source = stealthAddressDao.getByAddress(mergeScan.stealthAddress)
+}
+```
+
+<Steps>
+  <Step title="Detect insufficient single-address balance">
+    If no single stealth address has enough USDC, but the total balance is sufficient, trigger pool-on-merge.
+  </Step>
+  
+  <Step title="Deposit all sources">
+    Deposit from each stealth address into the pool, creating note commitments.
+  </Step>
+  
+  <Step title="Withdraw to fresh address">
+    Generate a new stealth address and withdraw the combined balance using ZK proofs.
+  </Step>
+  
+  <Step title="Complete payment">
+    Use the fresh stealth address to complete the merchant payment.
+  </Step>
+</Steps>
+
+**Privacy benefit:** The payment is now unlinkable from the original stealth addresses. On-chain observers cannot determine which addresses funded the payment.
+
+## Transaction Unlinkability
+
+Combining stealth addresses and shielded pools provides strong unlinkability:
+
+### Scenario 1: Direct Payment (Stealth Addresses Only)
+
+```
+Alice receives $100 to stealth address SA1.
+Alice pays merchant $25 from SA1.
+
+On-chain view:
+  TX1: Unknown → SA1 ($100)
+  TX2: SA1 → Merchant ($25)
+
+Linkability: Merchant knows SA1 sent the payment, but SA1 is not linked to Alice's identity.
+```
+
+### Scenario 2: Payment via Pool-on-Merge
+
+```
+Alice receives $30 to SA1 and $40 to SA2.
+Alice needs to pay $50, which exceeds any single address.
+
+Pool-on-merge flow:
+  TX1: SA1 → Pool ($30)
+  TX2: SA2 → Pool ($40)
+  TX3: Pool → SA3 ($70, ZK proof)
+  TX4: SA3 → Merchant ($50)
+
+On-chain view:
+  - Merchant sees payment from SA3
+  - SA3 is not linked to SA1 or SA2 (ZK proof breaks linkage)
+  - Total privacy: Merchant cannot determine the original funding sources
+```
+
+## Performance
+
+| Operation | Time | Gas Cost | Proof Size |
+|-----------|------|----------|------------|
+| Stealth address derivation | ~1ms | - | - |
+| Announcement scanning (with view tag) | ~0.01ms per announcement | - | - |
+| Pool deposit | ~2s (tx submission) | ~0.02 SUI | - |
+| Pool withdraw proof generation | ~15s (mobile) | - | 256 bytes |
+| Pool withdraw on-chain | ~3s (tx submission) | ~0.05 SUI | - |
+
+<Note>
+Pool withdraw proof generation is the slowest operation (~15 seconds on mobile) due to the large circuit (~35K constraints). This is an acceptable tradeoff for the strong privacy guarantees.
+</Note>
+
+## Security Considerations
+
+<Accordion title="Stealth Address Key Management">
+Stealth private keys are derived deterministically from the spend key and shared secret. They are stored encrypted in the wallet database using Android Keystore / iOS Secure Enclave.
+
+**Never:**
+- Transmit stealth private keys over the network
+- Reuse stealth addresses (always derive fresh ones)
+- Share spend or view keys with third parties
+</Accordion>
+
+<Accordion title="Pool Nullifier Set">
+The nullifier set prevents double-spending. Each note can only be spent once—the nullifier is checked on-chain:
+
+```move
+assert!(!nullifier_set.contains(&nullifier), E_DOUBLE_SPEND);
+nullifier_set.insert(nullifier);
+```
+
+Nullifiers are deterministic (`Poseidon(commitment, ownerKey)`) so the same note always produces the same nullifier.
+</Accordion>
+
+<Accordion title="Merkle Tree Synchronization">
+The wallet rebuilds the Merkle tree client-side by replaying all deposit events. This ensures the proof is generated against the correct root.
+
+If deposits occur while generating a withdrawal proof, the wallet retries until the computed root matches the on-chain root (max 10 retries with 2s delays).
+</Accordion>
+
+<Accordion title="Pool Deposit Amount Visibility">
+Pool deposits reveal the sender address and amount on-chain. For maximum privacy:
+
+1. Use stealth addresses as deposit sources (sender is already pseudonymous)
+2. Deposit round amounts (e.g., $50, $100) to reduce fingerprinting
+3. Withdraw to fresh stealth addresses
+
+Future enhancement: Confidential transactions using Pedersen commitments could hide deposit amounts.
+</Accordion>
+
+## Anonymity Set Analysis
+
+The **anonymity set** is the number of possible senders for a transaction:
+
+```
+Anonymity Set Size = Number of notes in the pool at withdrawal time
+```
+
+Example: If there are 10,000 notes in the pool when Alice withdraws, an observer has a 1/10,000 chance of guessing which note she spent.
+
+**Growing the anonymity set:**
+- More users → more pool deposits → larger anonymity set
+- Pool-on-merge auto-deposits → more notes per user
+- Periodic "dummy" deposits (future enhancement) → larger set even without real transactions
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Always Use Stealth Addresses" icon="mask">
+    Never reuse Sui addresses. Let the wallet automatically derive fresh stealth addresses for every transaction.
+  </Card>
+  
+  <Card title="Enable Pool-on-Merge" icon="water">
+    The wallet automatically uses the pool when needed. Don't disable this feature—it's essential for unlinkability.
+  </Card>
+  
+  <Card title="Scan Regularly" icon="radar">
+    Run the announcement scanner periodically to detect incoming funds. The wallet does this automatically in the background.
+  </Card>
+  
+  <Card title="Back Up Keys" icon="key">
+    Your spend and view keys control all your stealth addresses and pool notes. Back them up securely (BIP-39 seed phrase).
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="Merchant Payments" icon="store" href="/use-cases/merchant-payments">
+    See how privacy features integrate into checkout
+  </Card>
+  
+  <Card title="Circuits Reference" icon="microchip" href="/circuits/pool-spend">
+    Explore the pool_spend circuit in detail
+  </Card>
+  
+  <Card title="Stealth API" icon="code" href="/api-reference/stealth">
+    Use stealth addresses in your application
+  </Card>
+</CardGroup>

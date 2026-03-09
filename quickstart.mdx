@@ -1,80 +1,341 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: "Quick Start"
+description: "Get started with identiPay in minutes - from wallet setup to your first privacy-preserving transaction"
 ---
 
-## Get started in three steps
+## Welcome to identiPay
 
-Get your documentation site running locally and make your first customization.
-
-### Step 1: Set up your local environment
-
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+identiPay is a privacy-preserving payment protocol that combines zero-knowledge proofs, stealth addresses, and blockchain technology to enable anonymous commerce with verifiable identity. This guide will walk you through setting up your wallet and making your first transaction.
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  **Prerequisites**: You'll need an Android device with NFC capability and a biometric passport (ePassport) to complete identity registration.
 </Note>
+
+## Installation
+
+<Steps>
+  <Step title="Download the Wallet App">
+    Install the identiPay Wallet from the Google Play Store or build from source:
+    
+    ```bash
+    git clone https://github.com/identipay/identipay.git
+    cd identipay/android/wallet-app
+    ./gradlew assembleDebug
+    ```
+    
+    The wallet app is built with Kotlin and Jetpack Compose, with native cryptography for stealth addresses and zero-knowledge proofs.
+  </Step>
+
+  <Step title="Create Your Identity">
+    On first launch, you'll be guided through the identity registration process:
+    
+    1. **Scan your passport** - Place your biometric passport on the device's NFC reader
+    2. **Enter your PIN** - This is combined with your passport data to derive a deterministic seed
+    3. **Choose your username** - Register a unique `@username.idpay` meta-address
+    
+    <Info>
+      Your identity commitment is computed as `Poseidon(issuerCertHash, docNumberHash, dobHash, userSalt)` and registered on-chain via a zero-knowledge proof. The proof verifies you have valid credentials without revealing any personal information.
+    </Info>
+    
+    The wallet derives your keypairs from your passport + PIN:
+    
+    ```kotlin
+    // From IdentityRepository.kt
+    seedManager.deriveFromPassportAndPin(
+        personalNumber = credentialData.rawPersonalNumber,
+        dateOfBirth = credentialData.rawDateOfBirth,
+        nationality = credentialData.rawNationality,
+        issuerCertHash = issuerCertHash,
+        pin = pin,
+    )
+    ```
+    
+    Two keypairs are generated:
+    - **Spend key** - Controls your funds
+    - **View key** - Scans for incoming payments
+  </Step>
+
+  <Step title="Get Testnet USDC">
+    identiPay currently operates on Sui testnet. You'll need testnet USDC to make payments:
+    
+    1. Copy your receive address from the wallet home screen
+    2. Visit the [Sui testnet faucet](https://testnet.sui.io/faucet)
+    3. Request testnet SUI
+    4. Swap for testnet USDC on a testnet DEX
+    
+    <Tip>
+      Each time you receive funds, a fresh stealth address is derived deterministically using your view key and a counter. This ensures payments are unlinkable on-chain.
+    </Tip>
+  </Step>
+</Steps>
+
+## Your First Transaction
+
+<Steps>
+  <Step title="Find a Merchant">
+    Try the demo checkout at `https://checkout.idpay.dev` or use the POS app:
+    
+    ```bash
+    cd identipay/android/identipayPOS
+    ./gradlew assembleDebug
+    ```
+    
+    The merchant creates a payment proposal via the backend API:
+    
+    ```typescript
+    // POST /api/identipay/v1/proposals
+    {
+      "amount": "5.00",
+      "currency": "USDC",
+      "description": "Coffee",
+      "constraints": {
+        "minAge": 18  // Optional age gate
+      }
+    }
+    ```
+    
+    You'll receive a QR code containing the transaction ID.
+  </Step>
+
+  <Step title="Scan the QR Code">
+    Open the identiPay wallet and tap **Scan to Pay**. The wallet:
+    
+    1. Fetches the proposal from the intent endpoint
+    2. Verifies the merchant's signature
+    3. Shows you the transaction details
+    
+    <CodeGroup>
+    ```kotlin Android Wallet
+    // From PaymentRepository.kt
+    val proposal = backendApi.getProposal(transactionId)
+    
+    // Verify merchant signature
+    intent.verifyMerchantSignature(
+        merchantPubkey = proposal.merchant.publicKey
+    )
+    ```
+    
+    ```http API Request
+    GET /api/identipay/v1/intents/{transaction-id}
+    
+    Response:
+    {
+      "intentHash": "0x...",
+      "merchant": {
+        "did": "did:identipay:merchant.com:...",
+        "name": "Coffee Shop",
+        "suiAddress": "0x..."
+      },
+      "amount": "5000000",
+      "expiresAt": "2026-03-09T20:15:00Z"
+    }
+    ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Review and Confirm">
+    The wallet displays:
+    - Merchant name and DID
+    - Amount in USDC
+    - Age gate requirements (if any)
+    - Encrypted receipt preview
+    
+    If the transaction requires age verification, the wallet generates a zero-knowledge proof:
+    
+    ```kotlin
+    // Age check proof verifies: currentYear - birthYear >= minAge
+    val ageProof = proofGenerator.generateAgeProof(
+        birthYear = userPreferences.getBirthYear(),
+        birthMonth = userPreferences.getBirthMonth(),
+        birthDay = userPreferences.getBirthDay(),
+        minAge = proposal.constraints.minAge
+    )
+    ```
+    
+    <Warning>
+      The proof reveals ONLY that you meet the age requirement - your actual birthdate remains private.
+    </Warning>
+  </Step>
+
+  <Step title="Execute Settlement">
+    When you tap **Confirm**, the wallet:
+    
+    1. Derives a fresh stealth address for receiving the receipt
+    2. Signs the intent hash with your spend key
+    3. Builds a Programmable Transaction Block (PTB)
+    4. Submits to the Sui blockchain
+    
+    ```kotlin
+    // The settlement PTB atomically:
+    // 1. Verifies ZK proof (if required)
+    // 2. Verifies intent signature
+    // 3. Transfers USDC to merchant
+    // 4. Mints encrypted receipt to your stealth address
+    
+    val txDigest = executeSendTransaction(
+        senderAddress = sourceStealthAddress,
+        senderPrivKey = stealthPrivKey,
+        recipientStealthAddress = merchantStealthAddress,
+        amountMicros = amountMicros,
+        ephemeralPubkey = ephemeralPubkey,
+        viewTag = viewTag,
+    )
+    ```
+    
+    The settlement contract ensures atomicity - either everything succeeds or everything fails:
+    
+    ```move
+    // From settlement.move:77-167
+    entry fun execute_commerce<T>(
+        state: &mut SettlementState,
+        payment: &mut Coin<T>,
+        amount: u64,
+        // ... ZK proof parameters
+        // ... encrypted receipt parameters
+    ) {
+        // 1. Verify ZK proof
+        zk_verifier::assert_proof_valid(zk_vk, &zk_proof, &zk_public_inputs);
+        
+        // 2. Verify intent signature
+        intent::verify_intent_signature(&intent_sig, &intent_hash, &buyer_pubkey);
+        
+        // 3. Transfer payment
+        let exact = coin::split(payment, amount, ctx);
+        transfer::public_transfer(exact, merchant);
+        
+        // 4. Mint receipt to stealth address
+        let receipt = receipt::mint_receipt(/* ... */);
+        transfer::public_transfer(receipt, buyer_stealth_addr);
+        
+        // 5. Emit settlement event
+        event::emit(SettlementEvent { intent_hash, /* ... */ });
+    }
+    ```
+  </Step>
+
+  <Step title="Receive Your Receipt">
+    The encrypted receipt is delivered to your stealth address. The wallet:
+    
+    1. Scans for new stealth announcements
+    2. Derives the stealth private key
+    3. Decrypts the receipt using ECDH
+    4. Stores it locally in your transaction history
+    
+    ```kotlin
+    // From AnnouncementRepository.kt
+    val announcements = backendApi.getAnnouncements(since = lastSync)
+    
+    for (announcement in announcements) {
+        // Check if this stealth address belongs to us
+        val scanResult = stealthAddress.scan(
+            viewPrivateKey = viewPriv,
+            spendPrivateKey = spendPriv,
+            ephemeralPubkey = announcement.ephemeralPubkey,
+            announcedViewTag = announcement.viewTag,
+            announcedStealthAddress = announcement.stealthAddress
+        )
+        
+        if (scanResult != null) {
+            // This is ours! Decrypt the receipt
+            val receipt = decryptReceipt(scanResult.stealthPrivateKey)
+            storeTransaction(receipt)
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+## Advanced: Shielded Pool for Privacy
+
+If you need to merge coins from multiple stealth addresses, the wallet automatically uses the shielded pool:
+
+<Steps>
+  <Step title="Automatic Pool-on-Merge">
+    When your largest stealth address has insufficient balance:
+    
+    ```kotlin
+    // From PaymentRepository.kt:67-108
+    if (source == null && totalBalance >= amountMicros) {
+        // 1. Deposit all sources into the shielded pool
+        for (src in sources) {
+            poolRepository.deposit(src.balanceUsdc, src.stealthAddress, privKey)
+        }
+        
+        // 2. Derive a fresh stealth address
+        val mergeAddr = deriveReceiveAddress(counter)
+        
+        // 3. Withdraw to fresh address via ZK proof
+        for (note in unspentNotes) {
+            poolRepository.withdraw(
+                noteId = note.id,
+                recipientAddress = mergeAddr.stealthAddress,
+                amount = note.amount
+            )
+        }
+    }
+    ```
+    
+    This breaks the on-chain link between your old addresses and the new merged output.
+  </Step>
+</Steps>
+
+## Backend API Reference
+
+The identiPay backend exposes these key endpoints:
+
+<CardGroup cols={2}>
+  <Card title="Announcements" icon="bell">
+    `GET /api/identipay/v1/announcements` - Query stealth address announcements with optional view tag filtering
+  </Card>
+  
+  <Card title="Intents" icon="file-contract">
+    `GET /api/identipay/v1/intents/{txId}` - Resolve a payment proposal by transaction ID
+  </Card>
+  
+  <Card title="Names" icon="at">
+    `GET /api/identipay/v1/names/{name}` - Resolve a meta-address to public keys
+  </Card>
+  
+  <Card title="Merchants" icon="store">
+    `POST /api/identipay/v1/merchants/register` - Register a new merchant DID
+  </Card>
+</CardGroup>
+
+## WebSocket Status Updates
+
+Subscribe to real-time settlement status:
+
+```typescript
+const ws = new WebSocket('wss://api.idpay.dev/ws/transactions/{txId}');
+
+ws.onmessage = (event) => {
+  const { status, txDigest } = JSON.parse(event.data);
+  // status: "pending" | "settled" | "failed"
+};
+```
+
+The backend polls for `SettlementEvent` emissions and pushes updates to connected clients.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture Overview" icon="sitemap" href="/architecture">
+    Understand the full system design - contracts, circuits, and mobile apps
+  </Card>
+  
+  <Card title="Smart Contracts" icon="file-code" href="/protocol/contracts">
+    Dive into the Sui Move contracts powering settlements
+  </Card>
+  
+  <Card title="ZK Circuits" icon="microchip" href="/protocol/circuits">
+    Learn how zero-knowledge proofs preserve privacy
+  </Card>
+  
+  <Card title="Backend API" icon="server" href="/api-reference/introduction">
+    Full API reference for integrating with identiPay
+  </Card>
+</CardGroup>
+
+<Warning>
+  **Testnet Only**: identiPay is currently deployed on Sui testnet. Do not use real funds or real identity documents. All transactions use testnet tokens with no real-world value.
+</Warning>

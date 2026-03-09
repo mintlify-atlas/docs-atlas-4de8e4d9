@@ -1,0 +1,600 @@
+---
+title: "Meta-Address Registry Contract"
+description: "Name-to-stealth-keys resolution system with anti-sybil protection"
+---
+
+## Overview
+
+The Meta-Address Registry contract (`identipay::meta_address_registry`) implements identiPay's stealth identity system. It maps human-readable names (like "@alice.idpay") to cryptographic public keys for stealth address derivation.
+
+**Key Properties:**
+- Names resolve to **public keys only**, never to Sui addresses
+- One government credential can register **exactly one name** (anti-sybil)
+- Names are **permanent** but keys can be rotated
+- Registration requires a **ZK proof** of credential ownership
+
+Per the whitepaper section 4.3, this enables privacy-preserving payments where senders derive fresh one-time addresses for each transaction.
+
+## Source Code
+
+Location: `contracts/sources/meta_address_registry.move:10`
+
+## How It Works
+
+<Steps>
+  <Step title="Credential Commitment">
+    User computes identity commitment `C = Poseidon(credential_fields)` from their government ID.
+  </Step>
+  
+  <Step title="ZK Proof Generation">
+    User generates a proof that C is backed by a valid credential without revealing the credential.
+  </Step>
+  
+  <Step title="Name Registration">
+    User submits name, public keys, commitment, and ZK proof. Contract verifies and registers the name.
+  </Step>
+  
+  <Step title="Anti-Sybil Enforcement">
+    The commitment is permanently bound to the name. Same credential cannot register another name.
+  </Step>
+  
+  <Step title="Stealth Address Derivation">
+    Senders resolve names to public keys and derive one-time stealth addresses for payments.
+  </Step>
+</Steps>
+
+## Data Structures
+
+### MetaAddressRegistry
+
+Shared registry mapping names to stealth meta-addresses.
+
+<ParamField body="id" type="UID" required>
+  Sui object identifier
+</ParamField>
+
+<ParamField body="names" type="Table<String, ID>" required>
+  Maps name to MetaAddressEntry object ID (for ownership tracking)
+</ParamField>
+
+<ParamField body="meta_addresses" type="Table<String, MetaAddress>" required>
+  Maps name to public keys (for direct on-chain resolution)
+</ParamField>
+
+<ParamField body="commitments" type="Table<vector<u8>, String>" required>
+  Maps identity commitment to name (anti-sybil: one credential = one name)
+</ParamField>
+
+```move
+public struct MetaAddressRegistry has key {
+    id: UID,
+    names: Table<String, ID>,
+    meta_addresses: Table<String, MetaAddress>,
+    commitments: Table<vector<u8>, String>,
+}
+```
+
+### MetaAddress
+
+On-chain lookup record storing the public keys needed for stealth address derivation.
+
+<ParamField body="spend_pubkey" type="vector<u8>" required>
+  Ed25519 spending public key (32 bytes) for address derivation
+</ParamField>
+
+<ParamField body="view_pubkey" type="vector<u8>" required>
+  X25519 viewing public key (32 bytes) for payment detection
+</ParamField>
+
+```move
+public struct MetaAddress has store, copy, drop {
+    spend_pubkey: vector<u8>,
+    view_pubkey: vector<u8>,
+}
+```
+
+**No Sui address** — only cryptographic keys. This ensures privacy: on-chain observers cannot link names to transaction addresses.
+
+### MetaAddressEntry
+
+Owned object representing a registered name. Held by the registrant for key rotation.
+
+<ParamField body="id" type="UID" required>
+  Sui object identifier
+</ParamField>
+
+<ParamField body="name" type="String" required>
+  The registered name (e.g., "alice")
+</ParamField>
+
+<ParamField body="spend_pubkey" type="vector<u8>" required>
+  Ed25519 spending public key (32 bytes)
+</ParamField>
+
+<ParamField body="view_pubkey" type="vector<u8>" required>
+  X25519 viewing public key (32 bytes)
+</ParamField>
+
+<ParamField body="identity_commitment" type="vector<u8>" required>
+  Poseidon hash of credential fields (anti-sybil binding)
+</ParamField>
+
+<ParamField body="created_at" type="u64" required>
+  Registration timestamp (epoch ms)
+</ParamField>
+
+```move
+public struct MetaAddressEntry has key, store {
+    id: UID,
+    name: String,
+    spend_pubkey: vector<u8>,
+    view_pubkey: vector<u8>,
+    identity_commitment: vector<u8>,
+    created_at: u64,
+}
+```
+
+### Events
+
+#### NameRegistered
+
+Emitted when a name is successfully registered.
+
+<ResponseField name="name" type="String">
+  Registered name
+</ResponseField>
+
+<ResponseField name="spend_pubkey" type="vector<u8>">
+  Ed25519 spending public key
+</ResponseField>
+
+<ResponseField name="view_pubkey" type="vector<u8>">
+  X25519 viewing public key
+</ResponseField>
+
+<ResponseField name="identity_commitment" type="vector<u8>">
+  Identity commitment hash
+</ResponseField>
+
+#### KeysRotated
+
+Emitted when keys are rotated.
+
+<ResponseField name="name" type="String">
+  Name whose keys were rotated
+</ResponseField>
+
+<ResponseField name="new_spend_pubkey" type="vector<u8>">
+  New spending public key
+</ResponseField>
+
+<ResponseField name="new_view_pubkey" type="vector<u8>">
+  New viewing public key
+</ResponseField>
+
+## Entry Functions
+
+### register_name
+
+Register a new name with stealth meta-address. Requires ZK proof of credential ownership.
+
+**Function Signature:**
+
+```move
+entry fun register_name(
+    registry: &mut MetaAddressRegistry,
+    vk: &VerificationKey,
+    name: String,
+    spend_pubkey: vector<u8>,
+    view_pubkey: vector<u8>,
+    identity_commitment: vector<u8>,
+    zk_proof: vector<u8>,
+    zk_public_inputs: vector<u8>,
+    ctx: &mut TxContext,
+)
+```
+
+<ParamField path="registry" type="&mut MetaAddressRegistry" required>
+  Mutable reference to the meta-address registry
+</ParamField>
+
+<ParamField path="vk" type="&VerificationKey" required>
+  ZK verification key for identity registration circuit
+</ParamField>
+
+<ParamField path="name" type="String" required>
+  Name to register (3-20 chars, lowercase alphanumeric + hyphens)
+</ParamField>
+
+<ParamField path="spend_pubkey" type="vector<u8>" required>
+  Ed25519 spending public key (exactly 32 bytes)
+</ParamField>
+
+<ParamField path="view_pubkey" type="vector<u8>" required>
+  X25519 viewing public key (exactly 32 bytes)
+</ParamField>
+
+<ParamField path="identity_commitment" type="vector<u8>" required>
+  Poseidon(credential_fields) commitment
+</ParamField>
+
+<ParamField path="zk_proof" type="vector<u8>" required>
+  Groth16 proof bytes
+</ParamField>
+
+<ParamField path="zk_public_inputs" type="vector<u8>" required>
+  Public inputs: [identity_commitment]
+</ParamField>
+
+**Errors:**
+
+- `EInvalidNameLength` (2): Name is < 3 or > 20 characters
+- `EInvalidNameCharacter` (3): Name contains invalid characters or starts/ends with hyphen
+- `EInvalidSpendPubkeyLength` (4): Spend pubkey is not 32 bytes
+- `EInvalidViewPubkeyLength` (5): View pubkey is not 32 bytes
+- `EEmptyIdentityCommitment` (6): Identity commitment is empty
+- `ENameAlreadyTaken` (0): Name already registered
+- `ECommitmentAlreadyRegistered` (1): This credential already registered a different name
+- `EProofVerificationFailed` (7): ZK proof is invalid
+
+**Location:** `meta_address_registry.move:112-164`
+
+**Example:**
+
+<CodeGroup>
+
+```typescript TypeScript
+import { generateIdentityProof } from '@identipay/zk';
+import { generateKeyPair } from '@identipay/crypto';
+import { poseidon } from '@identipay/crypto';
+
+// Generate keypairs for stealth addresses
+const spendKeys = generateKeyPair('ed25519');
+const viewKeys = generateKeyPair('x25519');
+
+// Compute identity commitment from government ID
+const commitment = poseidon([
+  BigInt(credential.firstName),
+  BigInt(credential.lastName),
+  BigInt(credential.birthdate),
+  BigInt(credential.idNumber),
+]);
+
+// Generate ZK proof of credential ownership
+const { proof, publicInputs } = await generateIdentityProof({
+  credential,
+  commitment,
+});
+
+// Register name on-chain
+const tx = new TransactionBlock();
+tx.moveCall({
+  target: `${PACKAGE_ID}::meta_address_registry::register_name`,
+  arguments: [
+    tx.object(REGISTRY_ID),
+    tx.object(IDENTITY_VK_ID),
+    tx.pure('alice'),
+    tx.pure(Array.from(spendKeys.publicKey)),
+    tx.pure(Array.from(viewKeys.publicKey)),
+    tx.pure(Array.from(commitment)),
+    tx.pure(proof),
+    tx.pure(publicInputs),
+  ],
+});
+
+const result = await wallet.signAndExecuteTransactionBlock({
+  transactionBlock: tx,
+});
+
+// Save private keys securely
+await secureStorage.set('spend_private_key', spendKeys.privateKey);
+await secureStorage.set('view_private_key', viewKeys.privateKey);
+
+console.log('Registered @alice.idpay');
+```
+
+</CodeGroup>
+
+### rotate_keys
+
+Rotate keys for a registered name. Requires ZK proof binding to the same identity commitment.
+
+**Function Signature:**
+
+```move
+entry fun rotate_keys(
+    registry: &mut MetaAddressRegistry,
+    entry: &mut MetaAddressEntry,
+    vk: &VerificationKey,
+    new_spend_pubkey: vector<u8>,
+    new_view_pubkey: vector<u8>,
+    zk_proof: vector<u8>,
+    zk_public_inputs: vector<u8>,
+)
+```
+
+<ParamField path="registry" type="&mut MetaAddressRegistry" required>
+  Mutable reference to the registry
+</ParamField>
+
+<ParamField path="entry" type="&mut MetaAddressEntry" required>
+  Mutable reference to the owned entry (caller must own this)
+</ParamField>
+
+<ParamField path="vk" type="&VerificationKey" required>
+  ZK verification key
+</ParamField>
+
+<ParamField path="new_spend_pubkey" type="vector<u8>" required>
+  New Ed25519 spending public key (32 bytes)
+</ParamField>
+
+<ParamField path="new_view_pubkey" type="vector<u8>" required>
+  New X25519 viewing public key (32 bytes)
+</ParamField>
+
+<ParamField path="zk_proof" type="vector<u8>" required>
+  Groth16 proof bytes
+</ParamField>
+
+<ParamField path="zk_public_inputs" type="vector<u8>" required>
+  Public inputs: [identity_commitment] (must match entry.identity_commitment)
+</ParamField>
+
+**Errors:**
+
+- `EInvalidSpendPubkeyLength` (4): New spend pubkey is not 32 bytes
+- `EInvalidViewPubkeyLength` (5): New view pubkey is not 32 bytes
+- `EProofVerificationFailed` (7): ZK proof is invalid
+
+**Location:** `meta_address_registry.move:169-199`
+
+**Example:**
+
+<CodeGroup>
+
+```typescript TypeScript
+import { generateKeyPair } from '@identipay/crypto';
+
+// Generate fresh keypairs
+const newSpendKeys = generateKeyPair('ed25519');
+const newViewKeys = generateKeyPair('x25519');
+
+// Generate ZK proof (same commitment as original registration)
+const { proof, publicInputs } = await generateIdentityProof({
+  credential,
+  commitment: originalCommitment,
+});
+
+// Rotate keys
+const tx = new TransactionBlock();
+tx.moveCall({
+  target: `${PACKAGE_ID}::meta_address_registry::rotate_keys`,
+  arguments: [
+    tx.object(REGISTRY_ID),
+    tx.object(entryObjectId), // owned MetaAddressEntry
+    tx.object(IDENTITY_VK_ID),
+    tx.pure(Array.from(newSpendKeys.publicKey)),
+    tx.pure(Array.from(newViewKeys.publicKey)),
+    tx.pure(proof),
+    tx.pure(publicInputs),
+  ],
+});
+
+await wallet.signAndExecuteTransactionBlock({ transactionBlock: tx });
+
+// Update stored private keys
+await secureStorage.set('spend_private_key', newSpendKeys.privateKey);
+await secureStorage.set('view_private_key', newViewKeys.privateKey);
+```
+
+</CodeGroup>
+
+## Public Functions
+
+### resolve_name
+
+Resolve a name to its meta-address (spend + view public keys). Primary lookup function.
+
+```move
+public fun resolve_name(
+    registry: &MetaAddressRegistry,
+    name: String
+): (vector<u8>, vector<u8>)
+```
+
+<ParamField path="registry" type="&MetaAddressRegistry" required>
+  Reference to the registry
+</ParamField>
+
+<ParamField path="name" type="String" required>
+  Name to resolve
+</ParamField>
+
+<ResponseField name="spend_pubkey" type="vector<u8>">
+  Ed25519 spending public key (32 bytes)
+</ResponseField>
+
+<ResponseField name="view_pubkey" type="vector<u8>">
+  X25519 viewing public key (32 bytes)
+</ResponseField>
+
+**Errors:**
+
+- `ENameNotFound` (8): Name is not registered
+
+**Location:** `meta_address_registry.move:208-212`
+
+**Example:**
+
+<CodeGroup>
+
+```typescript Stealth Address Derivation
+import { deriveStealthAddress } from '@identipay/crypto';
+
+// Sender resolves recipient's name
+const [spendPubkey, viewPubkey] = await identiPayClient.resolveName(
+  'alice'
+);
+
+// Derive one-time stealth address
+const ephemeralPrivateKey = randomBytes(32);
+const stealthAddress = deriveStealthAddress(
+  spendPubkey,
+  viewPubkey,
+  ephemeralPrivateKey
+);
+
+// Compute view tag for fast scanning
+const sharedSecret = deriveECDH(ephemeralPrivateKey, viewPubkey);
+const viewTag = sharedSecret[0]; // first byte
+
+// Send payment to stealthAddress and emit announcement
+await sendPayment({
+  recipient: stealthAddress,
+  amount,
+  ephemeralPubkey: derivePublicKey(ephemeralPrivateKey),
+  viewTag,
+});
+```
+
+</CodeGroup>
+
+### resolve_entry
+
+Resolve from an owned MetaAddressEntry object directly.
+
+```move
+public fun resolve_entry(
+    entry: &MetaAddressEntry
+): (vector<u8>, vector<u8>)
+```
+
+**Location:** `meta_address_registry.move:216-218`
+
+### name_exists
+
+Check if a name is registered.
+
+```move
+public fun name_exists(
+    registry: &MetaAddressRegistry,
+    name: String
+): bool
+```
+
+**Location:** `meta_address_registry.move:221-223`
+
+### commitment_exists
+
+Check if an identity commitment is already registered.
+
+```move
+public fun commitment_exists(
+    registry: &MetaAddressRegistry,
+    commitment: vector<u8>
+): bool
+```
+
+**Location:** `meta_address_registry.move:226-228`
+
+### MetaAddressEntry Accessors
+
+```move
+public fun entry_name(entry: &MetaAddressEntry): String
+public fun entry_spend_pubkey(entry: &MetaAddressEntry): vector<u8>
+public fun entry_view_pubkey(entry: &MetaAddressEntry): vector<u8>
+public fun entry_identity_commitment(entry: &MetaAddressEntry): vector<u8>
+public fun entry_created_at(entry: &MetaAddressEntry): u64
+```
+
+**Location:** `meta_address_registry.move:232-236`
+
+## Name Validation
+
+Names must follow these rules:
+- **Length**: 3-20 characters
+- **Characters**: Lowercase a-z, digits 0-9, hyphens
+- **Format**: Cannot start or end with hyphen
+
+**Valid names:**
+- `alice`
+- `bob-smith`
+- `user123`
+- `coffee-shop-sf`
+
+**Invalid names:**
+- `ab` (too short)
+- `Alice` (uppercase)
+- `-alice` (starts with hyphen)
+- `alice-` (ends with hyphen)
+- `alice_bob` (underscore not allowed)
+
+**Location:** `meta_address_registry.move:242-261`
+
+## Anti-Sybil Mechanism
+
+<AccordionGroup>
+  <Accordion title="One Credential, One Name" icon="fingerprint">
+    Each identity commitment can only register one name. This prevents users with a single government ID from squatting multiple names.
+  </Accordion>
+  
+  <Accordion title="Commitment Permanence" icon="lock">
+    The commitment-to-name binding is permanent. Even after key rotation, the same commitment remains bound to the same name.
+  </Accordion>
+  
+  <Accordion title="ZK Privacy" icon="eye-slash">
+    The ZK proof reveals only that the user has a valid credential, not the credential details (name, DOB, etc.).
+  </Accordion>
+  
+  <Accordion title="No Name Transfers" icon="ban">
+    Names cannot be transferred or sold. The MetaAddressEntry object is owned by the registrant and cannot change hands.
+  </Accordion>
+</AccordionGroup>
+
+## Stealth Address Derivation
+
+The registry enables **stealth addresses** per the Dual-Key Stealth Address Protocol (DKSAP):
+
+1. **Sender** resolves recipient's name to `(K_spend, K_view)`
+2. **Sender** generates ephemeral keypair `(r, R = r*G)`
+3. **Sender** computes shared secret `S = r * K_view`
+4. **Sender** derives stealth address `P = K_spend + Hash(S)*G`
+5. **Sender** sends payment to `P` and emits announcement with `R`
+6. **Recipient** scans announcements, computes `S = k_view * R`
+7. **Recipient** checks if `P == K_spend + Hash(S)*G`
+8. **Recipient** derives private key `p = k_spend + Hash(S)`
+
+This creates a **one-time address** that only the recipient can detect and spend from.
+
+## Security Considerations
+
+<Warning>
+  **Credential Privacy**: The ZK circuit must be carefully designed to prevent linkage between registrations. Use proper randomness in proof generation.
+</Warning>
+
+<Warning>
+  **Key Compromise**: If a user's spend private key is compromised, attackers can spend funds from all past stealth addresses. Key rotation does NOT retroactively protect past addresses.
+</Warning>
+
+<Note>
+  **View Key Separation**: The view key can safely be shared with third parties (like exchanges) for payment detection without granting spend authority.
+</Note>
+
+<Info>
+  **On-Chain Resolution**: Name resolution happens entirely on-chain with no external dependencies, ensuring censorship resistance and availability.
+</Info>
+
+## Related Modules
+
+<CardGroup cols={2}>
+  <Card title="Announcements" icon="bullhorn" href="/protocol/announcements">
+    Stealth payment detection events
+  </Card>
+  <Card title="ZK Verifier" icon="lock" href="/protocol/zk-verifier">
+    Groth16 proof verification for identity
+  </Card>
+  <Card title="Settlement" icon="hand-holding-dollar" href="/protocol/settlement">
+    Uses stealth addresses for receipt delivery
+  </Card>
+</CardGroup>

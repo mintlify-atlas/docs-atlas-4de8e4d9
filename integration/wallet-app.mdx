@@ -1,0 +1,445 @@
+---
+title: 'Wallet App (Android)'
+description: 'User wallet application for privacy-preserving payments with zero-knowledge proofs'
+icon: 'mobile'
+---
+
+## Overview
+
+The identiPay wallet app is an Android application that enables users to:
+
+- Register their identity using passport NFC scanning
+- Create a privacy-preserving wallet with stealth addresses
+- Make anonymous payments using zero-knowledge proofs
+- Receive payments via stealth addresses
+- Manage balance and transaction history
+
+## Features
+
+### Identity Registration
+
+The wallet uses passport-based identity registration with zero-knowledge proofs:
+
+- **NFC Passport Scanning**: Extracts identity data from e-passports
+- **Deterministic Key Derivation**: Generates wallet keys from passport data + PIN
+- **Identity Commitment**: Creates a privacy-preserving commitment to identity attributes
+- **ZK Proof Generation**: Proves identity ownership without revealing passport data
+- **Name Registration**: Registers a human-readable name on-chain
+
+### Privacy Features
+
+- **Stealth Addresses**: Each payment creates a unique one-time address
+- **Zero-Knowledge Proofs**: Prove payment validity without revealing identity
+- **Encrypted Announcements**: Payment notifications with view tag optimization
+- **Shielded Pool**: Privacy-preserving asset pool
+
+### Payment Capabilities
+
+- Scan QR codes or NFC tags to initiate payments
+- Age verification using ZK proofs (for age-restricted purchases)
+- Real-time transaction status via WebSocket
+- Receipt generation and storage
+
+## Setup Instructions
+
+<Steps>
+
+<Step title="Clone the Repository">
+
+```bash
+git clone https://github.com/your-org/identipay.git
+cd identipay/android/wallet-app
+```
+
+</Step>
+
+<Step title="Configure Backend URL">
+
+Update the backend URL in `app/src/main/java/com/identipay/wallet/di/NetworkModule.kt`:
+
+```kotlin
+const val BASE_URL = "https://identipay.me/api/identipay/v1/"
+```
+
+For local development:
+
+```kotlin
+const val BASE_URL = "http://10.0.2.2:8000/api/identipay/v1/"
+```
+
+<Note>
+The URL `10.0.2.2` is the special alias for `localhost` from the Android emulator.
+</Note>
+
+</Step>
+
+<Step title="Configure Sui Network">
+
+Update Sui network configuration in `app/src/main/java/com/identipay/wallet/network/SuiClientProvider.kt`:
+
+```kotlin
+object SuiClientProvider {
+    const val SUI_TESTNET_URL = "https://fullnode.testnet.sui.io:443"
+    const val PACKAGE_ID = "0x1d78444dc29300d7ef1fda1cc292b154cba7dce8de68e12371f89179c3fdaf19"
+    const val META_REGISTRY_ID = "0x..."
+    const val SHIELDED_POOL_ID = "0x..."
+}
+```
+
+</Step>
+
+<Step title="Install Dependencies">
+
+The app uses Gradle for dependency management. Key dependencies:
+
+```kotlin
+// Hilt for dependency injection
+implementation(libs.hilt.android)
+
+// Room for local database
+implementation(libs.room.runtime)
+
+// Ktor for HTTP client
+implementation(libs.ktor.client.okhttp)
+
+// BouncyCastle for cryptography
+implementation(libs.bcprov.jdk18on)
+
+// JMRTD for passport NFC reading
+implementation(libs.jmrtd)
+
+// Sui SDK
+implementation(libs.ksui.android)
+
+// WorkManager for background tasks
+implementation(libs.work.runtime.ktx)
+```
+
+</Step>
+
+<Step title="Build and Run">
+
+```bash
+# Build the app
+./gradlew assembleDebug
+
+# Install on connected device/emulator
+./gradlew installDebug
+
+# Or open in Android Studio
+android-studio .
+```
+
+</Step>
+
+</Steps>
+
+## Identity Registration Flow
+
+<Steps>
+
+<Step title="Scan Passport">
+
+The app uses NFC to read e-passport data:
+
+```kotlin
+// The passport scanner extracts:
+- Personal number (document number)
+- Date of birth
+- Nationality
+- Issuer certificate
+```
+
+</Step>
+
+<Step title="Enter PIN">
+
+The user creates a PIN that, combined with passport data, derives the wallet seed:
+
+```kotlin
+seedManager.deriveFromPassportAndPin(
+    personalNumber = credentialData.rawPersonalNumber,
+    dateOfBirth = credentialData.rawDateOfBirth,
+    nationality = credentialData.rawNationality,
+    issuerCertHash = issuerCertHash,
+    pin = pin,
+)
+```
+
+<Warning>
+The PIN must be remembered - it cannot be recovered if lost.
+</Warning>
+
+</Step>
+
+<Step title="Choose Username">
+
+Select a unique username (3-20 characters):
+
+```kotlin
+val isAvailable = identityRepository.isNameAvailable(name)
+```
+
+</Step>
+
+<Step title="Generate ZK Proof">
+
+The app generates a zero-knowledge proof of identity:
+
+```kotlin
+val circuitInput = IdentityRegistrationInput.create(
+    issuerCertHash = credentialData.issuerCertHash,
+    personalNumberHash = credentialData.personalNumberHash,
+    dobHash = credentialData.dobHash,
+    userSalt = userSalt,
+)
+val proofResult = proofGenerator.generateIdentityProof(circuitInput)
+```
+
+</Step>
+
+<Step title="Submit Registration">
+
+The proof and public keys are submitted to the backend:
+
+```kotlin
+val request = RegistrationRequest(
+    name = name,
+    spendPubkey = spendPubkey.toHexString(),
+    viewPubkey = viewPubkey.toHexString(),
+    identityCommitment = commitmentBytes.toHexString(),
+    zkProof = proofResult.proofBytes.toHexString(),
+    zkPublicInputs = proofResult.publicInputsBytes.toHexString(),
+)
+val response = backendApi.registerName(request)
+```
+
+</Step>
+
+</Steps>
+
+## Background Tasks
+
+The wallet app uses WorkManager for periodic background tasks:
+
+### Announcement Scanning
+
+```kotlin
+// Scans for new stealth address announcements every 15 minutes
+val announcementWork = PeriodicWorkRequestBuilder<AnnouncementScanWorker>(
+    15, TimeUnit.MINUTES,
+).addTag(AnnouncementScanWorker.TAG).build()
+```
+
+### Balance Refresh
+
+```kotlin
+// Refreshes balance from the blockchain every 15 minutes
+val balanceWork = PeriodicWorkRequestBuilder<BalanceRefreshWorker>(
+    15, TimeUnit.MINUTES,
+).addTag(BalanceRefreshWorker.TAG).build()
+```
+
+## Local Database Schema
+
+The wallet uses Room for local storage:
+
+### Notes Table
+
+Stores received payment notes:
+
+```kotlin
+@Entity(tableName = "notes")
+data class NoteEntity(
+    @PrimaryKey val noteId: String,
+    val stealthAddress: String,
+    val amount: String,
+    val currency: String,
+    val ephemeralPubkey: String,
+    val metadata: String?,
+    val spent: Boolean,
+    val timestamp: Long,
+)
+```
+
+### Stealth Addresses Table
+
+```kotlin
+@Entity(tableName = "stealth_addresses")
+data class StealthAddressEntity(
+    @PrimaryKey val address: String,
+    val ephemeralPubkey: String,
+    val viewTag: Int,
+    val scanned: Boolean,
+    val timestamp: Long,
+)
+```
+
+### Transactions Table
+
+```kotlin
+@Entity(tableName = "transactions")
+data class TransactionEntity(
+    @PrimaryKey val txId: String,
+    val type: String, // "send" or "receive"
+    val amount: String,
+    val currency: String,
+    val status: String,
+    val timestamp: Long,
+    val suiTxDigest: String?,
+)
+```
+
+## Key Components
+
+### Cryptographic Operations
+
+<CodeGroup>
+
+```kotlin app/src/main/java/com/identipay/wallet/crypto/IdentityCommitment.kt
+// Computes Poseidon hash commitment to identity attributes
+fun compute(
+    issuerCertHash: BigInteger,
+    personalNumberHash: BigInteger,
+    dobHash: BigInteger,
+    userSalt: BigInteger,
+): BigInteger {
+    return poseidonHash.hash(listOf(
+        issuerCertHash,
+        personalNumberHash,
+        dobHash,
+        userSalt,
+    ))
+}
+```
+
+```kotlin app/src/main/java/com/identipay/wallet/crypto/StealthAddress.kt
+// Generates stealth addresses for privacy-preserving payments
+fun generate(
+    recipientViewPubkey: ByteArray,
+    recipientSpendPubkey: ByteArray,
+): StealthAddressResult {
+    val ephemeralKeypair = X25519Ops.generateKeypair()
+    val sharedSecret = X25519Ops.computeSharedSecret(
+        ephemeralKeypair.privateKey,
+        recipientViewPubkey,
+    )
+    // ...
+}
+```
+
+</CodeGroup>
+
+## Payment Flow
+
+<Steps>
+
+<Step title="Scan Payment Request">
+
+Scan QR code or tap NFC tag to get payment proposal:
+
+```kotlin
+val proposal = json.decodeFromString<PaymentProposal>(qrData)
+```
+
+</Step>
+
+<Step title="Review Transaction">
+
+Display merchant, amount, and items for user confirmation.
+
+</Step>
+
+<Step title="Generate ZK Proof">
+
+Create proof of payment intent:
+
+```kotlin
+val proofResult = proofGenerator.generatePaymentProof(paymentInput)
+```
+
+</Step>
+
+<Step title="Submit Transaction">
+
+Send signed intent to backend for settlement:
+
+```kotlin
+val response = paymentRepository.submitPayment(
+    intentHash = intentHash,
+    zkProof = proofResult.proofBytes,
+    signature = signature,
+)
+```
+
+</Step>
+
+<Step title="Monitor Status">
+
+Connect to WebSocket for real-time updates:
+
+```kotlin
+webSocketClient.connect("/ws/transactions/$txId")
+```
+
+</Step>
+
+</Steps>
+
+## Security Features
+
+### Biometric Authentication
+
+The wallet supports fingerprint/face unlock:
+
+```kotlin
+implementation(libs.androidx.biometric)
+```
+
+### Secure Key Storage
+
+Keys are encrypted and stored using Android Keystore:
+
+- Spend keypair (Ed25519)
+- View keypair (X25519)
+- Wallet seed (BIP39-derived)
+
+### BouncyCastle Provider
+
+```kotlin
+override fun onCreate() {
+    super.onCreate()
+    // Replace Android's stripped-down BouncyCastle with the full version
+    Security.removeProvider("BC")
+    Security.insertProviderAt(BouncyCastleProvider(), 1)
+}
+```
+
+## Testing
+
+```bash
+# Run unit tests
+./gradlew test
+
+# Run instrumented tests
+./gradlew connectedAndroidTest
+```
+
+## Requirements
+
+- **Android SDK**: 24+ (Android 7.0 Nougat)
+- **Target SDK**: 36
+- **NFC Support**: Required for passport scanning
+- **Camera**: Required for QR code scanning
+- **Internet**: Required for blockchain interaction
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="POS App" icon="cash-register" href="/integration/pos-app">
+    Set up the merchant point-of-sale application
+  </Card>
+  <Card title="Backend Setup" icon="server" href="/integration/backend-setup">
+    Configure the identiPay backend server
+  </Card>
+</CardGroup>

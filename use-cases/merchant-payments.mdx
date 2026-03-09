@@ -1,0 +1,524 @@
+---
+title: Merchant Payments
+description: End-to-end payment flow for privacy-preserving merchant checkout
+icon: store
+---
+
+identiPay enables privacy-preserving merchant payments using stealth addresses, encrypted receipts, and optional age verification. Merchants create payment proposals, users scan QR codes, and transactions settle on-chain with zero-knowledge proofs.
+
+## Payment Flow Overview
+
+The merchant payment flow consists of three main phases: proposal creation, customer checkout, and on-chain settlement.
+
+<Steps>
+  <Step title="Merchant creates payment proposal">
+    The merchant generates a payment request with items, amount, and optional constraints (like age requirements). The backend computes an intent hash that binds all payment parameters.
+  </Step>
+  
+  <Step title="Customer scans QR code">
+    The wallet app scans the merchant's QR code, fetches the proposal, and independently verifies the intent hash to prevent tampering.
+  </Step>
+  
+  <Step title="Wallet executes checkout">
+    The wallet derives a one-time stealth address for receipt delivery, signs the intent, encrypts the receipt for the merchant, and submits the settlement transaction.
+  </Step>
+  
+  <Step title="Transaction settles on-chain">
+    The settlement contract verifies signatures and ZK proofs (if age-gated), transfers USDC to the merchant, and emits an announcement event with the encrypted receipt.
+  </Step>
+</Steps>
+
+## Merchant: Creating a Payment Proposal
+
+Merchants use the backend API to create payment proposals. Each proposal includes line items, total amount, expiration, and optional constraints.
+
+### API Request
+
+```typescript
+POST /proposals
+Authorization: Bearer <merchant-api-key>
+
+{
+  "amount": {
+    "value": "24.99",
+    "currency": "USDC"
+  },
+  "items": [
+    {
+      "name": "Premium Wine (Cabernet Sauvignon 2019)",
+      "quantity": 1,
+      "unitPrice": "24.99"
+    }
+  ],
+  "deliverables": {
+    "receipt": {
+      "encrypted": true,
+      "format": "json"
+    },
+    "warranty": {
+      "durationDays": 30,
+      "transferable": true
+    }
+  },
+  "constraints": {
+    "ageGate": 21
+  },
+  "expiresInSeconds": 300
+}
+```
+
+### API Response
+
+The backend returns a QR code, proposal URI, and the intent hash that binds all parameters:
+
+```json
+{
+  "transactionId": "550e8400-e29b-41d4-a716-446655440000",
+  "intentHash": "0x3a7f8c9e...",
+  "qrDataUrl": "data:image/png;base64,iVBORw0KG...",
+  "uri": "identipay://pay/550e8400-e29b-41d4-a716-446655440000",
+  "expiresAt": "2026-03-09T10:15:00Z",
+  "proposal": {
+    "transactionId": "550e8400-e29b-41d4-a716-446655440000",
+    "merchant": {
+      "did": "did:identipay:merchant.example.com:...",
+      "name": "WineShop Demo",
+      "suiAddress": "0x1234...",
+      "publicKey": "0xabcd..."
+    },
+    "amount": { "value": "24.99", "currency": "USDC" },
+    "items": [...],
+    "deliverables": {...},
+    "constraints": { "ageGate": 21 },
+    "expiresAt": "2026-03-09T10:15:00Z",
+    "intentHash": "0x3a7f8c9e..."
+  }
+}
+```
+
+<Note>
+The **intent hash** is computed using Poseidon and binds the merchant DID, amount, expiration, age threshold, and settlement module address. This prevents tampering and replay attacks.
+</Note>
+
+### Displaying the QR Code
+
+Merchants display the QR code at point-of-sale terminals or checkout pages. The QR code encodes either:
+
+- **URI format**: `identipay://pay/{transactionId}`
+- **DID format**: `did:identipay:{hostname}:{transactionId}` (per whitepaper Section 5)
+- **Web URL**: `https://identipay.me/pay/{transactionId}`
+
+## Customer: Scanning and Review
+
+Customers use the identiPay wallet app to scan the merchant's QR code and review the payment details.
+
+### Scanning the QR Code
+
+The wallet's scanner screen detects identiPay QR codes and extracts the transaction ID:
+
+```kotlin
+// From ScannerViewModel.kt
+private val IDENTIPAY_PAY_REGEX = Regex("""identipay://pay/([a-f0-9-]+)""")
+private val IDENTIPAY_URL_REGEX = Regex("""https?://identipay\\.me/pay/([a-f0-9-]+)""")
+private val IDENTIPAY_DID_REGEX = Regex("""did:identipay:[^:]+:([a-f0-9-]+)""")
+```
+
+### Fetching the Proposal
+
+The wallet fetches the proposal from the backend and **independently verifies the intent hash**:
+
+```kotlin
+// From CommerceRepository.kt:62-76
+val proposal = backendApi.getIntent(txId)
+
+// Independently verify the intent hash
+if (!intentHashComputer.verify(proposal)) {
+    return Result.failure(
+        IllegalStateException("Intent hash verification failed — proposal may be tampered")
+    )
+}
+```
+
+<Warning>
+The wallet **never** trusts the backend's intent hash directly. It recomputes the hash from scratch using the same Poseidon circuit logic to prevent man-in-the-middle attacks.
+</Warning>
+
+### Review Screen
+
+The wallet displays:
+
+- Merchant name and DID
+- Line items with quantities and prices
+- Total amount in USDC
+- Age requirement (if any)
+- Expiration countdown
+- Warranty terms (if included)
+
+## Customer: Checkout Execution
+
+When the user confirms payment, the wallet orchestrates a multi-step checkout flow.
+
+<Steps>
+  <Step title="Derive buyer stealth address">
+    The wallet generates a one-time stealth address for receipt delivery. This prevents linking the buyer's public identity to the transaction.
+  </Step>
+  
+  <Step title="Generate ZK age proof (if required)">
+    If the merchant requires age verification (e.g., `ageGate: 21`), the wallet generates a zero-knowledge proof that the user is at least 21 years old without revealing their exact birth date.
+  </Step>
+  
+  <Step title="Encrypt receipt and warranty">
+    The wallet encrypts the receipt JSON using ECDH with the merchant's public key. The merchant can later decrypt it to fulfill the order.
+  </Step>
+  
+  <Step title="Sign and submit settlement">
+    The wallet signs the intent hash with the stealth address private key and submits the transaction via gas sponsorship.
+  </Step>
+</Steps>
+
+### Step 1: Derive Buyer Stealth Address
+
+The wallet creates a one-time stealth address so the merchant can send the encrypted receipt on-chain without revealing the buyer's main address:
+
+```kotlin
+// From CommerceRepository.kt:92-96
+val spendPub = walletKeys.getSpendPublicKey()
+val viewPub = walletKeys.getViewPublicKey()
+val buyerStealth = stealthAddress.derive(spendPub, viewPub)
+
+// Recover stealth private key for signing
+val viewPriv = walletKeys.getViewKeyPair().privateKey
+val spendPriv = walletKeys.getSpendKeyPair().privateKey
+val scanResult = stealthAddress.scan(
+    viewPrivateKey = viewPriv,
+    spendPrivateKey = spendPriv,
+    spendPubkey = spendPub,
+    ephemeralPubkey = buyerStealth.ephemeralPubkey,
+    announcedViewTag = buyerStealth.viewTag,
+    announcedStealthAddress = buyerStealth.stealthAddress,
+)
+```
+
+The stealth address is stored locally so the wallet can later decrypt the receipt:
+
+```kotlin
+stealthAddressDao.insert(
+    StealthAddressEntity(
+        stealthAddress = scanResult.stealthAddress,
+        stealthPrivKeyEnc = privKeyEnc,
+        stealthPubkey = scanResult.stealthPubkey.toHexString(),
+        ephemeralPubkey = buyerStealth.ephemeralPubkey.toHexString(),
+        viewTag = buyerStealth.viewTag,
+        createdAt = System.currentTimeMillis(),
+    )
+)
+```
+
+### Step 2: Generate ZK Age Proof (if required)
+
+If the proposal includes an age gate (e.g., for alcohol or tobacco), the wallet generates a zero-knowledge proof:
+
+```kotlin
+// From CheckoutViewModel.kt:102-153
+val hasAgeGate = proposal.constraints?.ageGate != null
+if (hasAgeGate) {
+    val birthYear = userPreferences.getBirthYearOnce()
+    val birthMonth = userPreferences.getBirthMonthOnce()
+    val birthDay = userPreferences.getBirthDayOnce()
+    val userSalt = BigInteger(userPreferences.getUserSaltOnce())
+    val identityCommitment = BigInteger(userPreferences.getIdentityCommitmentOnce())
+
+    // Compute dobHash = Poseidon(birthYear, birthMonth, birthDay)
+    val dobHash = PoseidonHash.hash3(
+        BigInteger.valueOf(birthYear.toLong()),
+        BigInteger.valueOf(birthMonth.toLong()),
+        BigInteger.valueOf(birthDay.toLong()),
+    )
+
+    // Parse intentHash from proposal
+    val intentHash = BigInteger(proposal.intentHash.removePrefix("0x"), 16)
+        .mod(PoseidonHash.FIELD_PRIME)
+
+    val ageCheckInput = AgeCheckInput.create(
+        birthYear = birthYear,
+        birthMonth = birthMonth,
+        birthDay = birthDay,
+        dobHash = dobHash,
+        userSalt = userSalt,
+        ageThreshold = proposal.constraints!!.ageGate!!,
+        referenceDate = 20260309, // YYYYMMDD format
+        identityCommitment = identityCommitment,
+        intentHash = intentHash,
+    )
+
+    val proofResult = proofGenerator.generateAgeProof(ageCheckInput)
+    zkProofBytes = proofResult.proofBytes
+    zkPublicInputsBytes = proofResult.publicInputsBytes
+}
+```
+
+The proof is generated client-side using snarkjs running in a WebView. The proof is ~256 bytes and takes ~2 seconds to generate on mobile devices.
+
+<Accordion title="What does the age proof reveal?">
+The age proof reveals:
+- The age threshold (e.g., 21)
+- The reference date (current date)
+- The user's identity commitment (public)
+- The intent hash (binds proof to this specific transaction)
+
+It does **not** reveal:
+- The user's exact birth date
+- Their identity documents
+- Any other personal information
+
+The proof can only be used for this specific transaction (intent hash binding) and cannot be replayed.
+</Accordion>
+
+### Step 3: Encrypt Receipt and Warranty
+
+The wallet builds receipt and warranty JSON payloads and encrypts them using ECDH:
+
+```kotlin
+// From CommerceRepository.kt:126-144
+val merchantPubKeyBytes = hexToBytes(proposal.merchant.publicKey)
+val receiptJson = buildReceiptJson(proposal)
+val encryptedReceipt = artifactEncryption.encrypt(
+    stealthPrivKey = scanResult.stealthPrivateKey,
+    merchantPubKey = merchantPubKeyBytes,
+    plaintext = receiptJson.toByteArray(Charsets.UTF_8),
+)
+
+val hasWarranty = proposal.deliverables.warranty != null
+val encryptedWarranty = if (hasWarranty) {
+    val warrantyJson = buildWarrantyJson(proposal)
+    artifactEncryption.encrypt(
+        stealthPrivKey = scanResult.stealthPrivateKey,
+        merchantPubKey = merchantPubKeyBytes,
+        plaintext = warrantyJson.toByteArray(Charsets.UTF_8),
+    )
+} else null
+```
+
+Receipt JSON structure:
+
+```json
+{
+  "transactionId": "550e8400-e29b-41d4-a716-446655440000",
+  "merchant": "WineShop Demo",
+  "items": [
+    {
+      "name": "Premium Wine (Cabernet Sauvignon 2019)",
+      "quantity": 1,
+      "unitPrice": "24.99"
+    }
+  ],
+  "amount": "24.99",
+  "currency": "USDC",
+  "timestamp": 1709982900000
+}
+```
+
+### Step 4: Sign and Submit Settlement
+
+The wallet uses gas sponsorship to submit the settlement transaction. The backend builds the programmable transaction block (PTB), the wallet signs with the stealth private key, and the backend co-signs as the gas payer:
+
+```kotlin
+// From CommerceRepository.kt:312-353
+val sponsorResponse = backendApi.sponsorSettlement(
+    GasSponsorSettlementRequest(
+        type = if (isAgeGated) "settlement" else "settlement_no_zk",
+        senderAddress = source.stealthAddress,
+        coinType = USDC_TYPE,
+        amount = amountMicros.toString(),
+        merchantAddress = proposal.merchant.suiAddress,
+        buyerStealthAddr = scanResult.stealthAddress,
+        intentSig = intentSig.map { it.toInt() and 0xFF },
+        intentHash = intentHashBytes.map { it.toInt() and 0xFF },
+        buyerPubkey = buyerPubkey.map { it.toInt() and 0xFF },
+        proposalExpiry = proposalExpiry.toString(),
+        encryptedPayload = encryptedReceipt.ciphertext.map { it.toInt() and 0xFF },
+        payloadNonce = encryptedReceipt.nonce.map { it.toInt() and 0xFF },
+        ephemeralPubkey = encryptedReceipt.ephemeralPubkey.map { it.toInt() and 0xFF },
+        encryptedWarrantyTerms = encryptedWarranty?.ciphertext?.map { it.toInt() and 0xFF } ?: emptyList(),
+        warrantyTermsNonce = encryptedWarranty?.nonce?.map { it.toInt() and 0xFF } ?: emptyList(),
+        warrantyExpiry = warrantyExpiry.toString(),
+        warrantyTransferable = warrantyTransferable,
+        stealthEphemeralPubkey = buyerStealth.ephemeralPubkey.map { it.toInt() and 0xFF },
+        stealthViewTag = buyerStealth.viewTag,
+        zkProof = zkProof?.map { it.toInt() and 0xFF },
+        zkPublicInputs = zkPublicInputs?.map { it.toInt() and 0xFF },
+    )
+)
+
+// Sign with stealth private key
+val signature = signTransaction(sponsorResponse.txBytes, senderPrivKey)
+
+// Submit via backend (backend co-signs as gas owner)
+val submitResponse = backendApi.submitSponsoredTx(
+    SubmitTxRequest(
+        txBytes = sponsorResponse.txBytes,
+        senderSignature = signature,
+    )
+)
+```
+
+<CardGroup cols={2}>
+  <Card title="Gas Sponsorship" icon="gas-pump">
+    The backend pays transaction gas fees, enabling seamless UX without requiring users to hold SUI tokens.
+  </Card>
+  
+  <Card title="Dual Signatures" icon="signature">
+    The wallet signs as the sender (transferring USDC), and the backend co-signs as the gas payer.
+  </Card>
+</CardGroup>
+
+## On-Chain Settlement
+
+The settlement transaction executes on Sui and:
+
+1. Verifies the intent signature against the buyer's stealth public key
+2. Verifies the ZK age proof (if present) against the intent hash
+3. Transfers USDC from buyer to merchant
+4. Emits an announcement event with the encrypted receipt
+5. Creates an on-chain warranty artifact (if included)
+
+```move
+public entry fun settle_with_age_proof(
+    coin: Coin<USDC>,
+    merchant_address: address,
+    buyer_stealth_addr: vector<u8>,
+    intent_sig: vector<u8>,
+    intent_hash: vector<u8>,
+    buyer_pubkey: vector<u8>,
+    proposal_expiry: u64,
+    encrypted_payload: vector<u8>,
+    payload_nonce: vector<u8>,
+    ephemeral_pubkey: vector<u8>,
+    encrypted_warranty_terms: vector<u8>,
+    warranty_terms_nonce: vector<u8>,
+    warranty_expiry: u64,
+    warranty_transferable: bool,
+    stealth_ephemeral_pubkey: vector<u8>,
+    stealth_view_tag: u8,
+    zk_proof: vector<u8>,
+    zk_public_inputs: vector<u8>,
+    ctx: &mut TxContext
+)
+```
+
+## Merchant: Decrypting Receipts
+
+After settlement, merchants scan announcement events to find receipts addressed to them. They decrypt using their private key:
+
+```typescript
+import { scanAnnouncement } from './stealth.service'
+
+// Scan announcement events
+for (const event of announcementEvents) {
+  const isForMe = scanAnnouncement(
+    merchantViewPrivateKey,
+    merchantSpendPubkey,
+    event.ephemeralPubkey,
+    event.viewTag,
+    event.buyerStealthAddress
+  )
+  
+  if (isForMe) {
+    // Decrypt the receipt
+    const receiptJson = decryptArtifact(
+      merchantPrivateKey,
+      event.encryptedPayload,
+      event.payloadNonce,
+      event.ephemeralPubkey
+    )
+    
+    // Fulfill the order
+    console.log('Receipt:', JSON.parse(receiptJson))
+  }
+}
+```
+
+## Pool-on-Merge (Advanced)
+
+If no single stealth address has sufficient balance, the wallet automatically uses the **pool-on-merge** flow:
+
+<Steps>
+  <Step title="Deposit all sources into shielded pool">
+    Each stealth address with USDC balance deposits into the pool, creating note commitments.
+  </Step>
+  
+  <Step title="Withdraw to fresh stealth address">
+    The wallet generates a fresh stealth address and withdraws the combined balance from the pool.
+  </Step>
+  
+  <Step title="Complete payment from merged address">
+    The payment proceeds using the fresh stealth address, breaking on-chain linkage.
+  </Step>
+</Steps>
+
+See [Privacy Protection](/use-cases/privacy-protection) for details on how the shielded pool works.
+
+## Testing the Flow
+
+<CodeGroup>
+```bash Merchant: Create Proposal
+curl -X POST https://api.identipay.me/proposals \
+  -H "Authorization: Bearer <merchant-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "amount": {"value": "24.99", "currency": "USDC"},
+    "items": [{"name": "Premium Wine", "quantity": 1, "unitPrice": "24.99"}],
+    "constraints": {"ageGate": 21},
+    "expiresInSeconds": 300
+  }'
+```
+
+```bash Check Transaction Status
+curl https://api.identipay.me/transactions/{txId}/status \
+  -H "Authorization: Bearer <merchant-api-key>"
+```
+</CodeGroup>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Privacy-Preserving" icon="shield">
+    Stealth addresses prevent linking buyer identity to transaction history.
+  </Card>
+  
+  <Card title="Age Verification" icon="id-card">
+    Zero-knowledge proofs enable age-gated purchases without revealing birth dates.
+  </Card>
+  
+  <Card title="Encrypted Receipts" icon="lock">
+    Receipts are encrypted on-chain and only the merchant can decrypt them.
+  </Card>
+  
+  <Card title="Gas Sponsorship" icon="gas-pump">
+    Backend pays gas fees for seamless user experience.
+  </Card>
+  
+  <Card title="Intent Hash Binding" icon="link">
+    Prevents tampering and replay attacks using Poseidon commitments.
+  </Card>
+  
+  <Card title="On-Chain Warranties" icon="certificate">
+    Warranties are stored as NFTs and can be transferred or verified on-chain.
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="Age Verification" icon="shield-check" href="/use-cases/age-verification">
+    Learn how the age_check circuit works
+  </Card>
+  
+  <Card title="Privacy Protection" icon="eye-slash" href="/use-cases/privacy-protection">
+    Understand stealth addresses and shielded pools
+  </Card>
+  
+  <Card title="API Reference" icon="code" href="/api-reference">
+    Explore the merchant API endpoints
+  </Card>
+</CardGroup>
