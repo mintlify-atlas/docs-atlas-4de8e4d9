@@ -23,7 +23,7 @@ The tree is a complete binary tree where:
 - **Internal nodes**: Poseidon(left_child, right_child)
 - **Root**: Single hash at the top (published on-chain)
 
-```
+```text
                     Root
                    /    \
                   /      \
@@ -128,7 +128,7 @@ fun insert_leaf<T>(pool: &mut ShieldedPool<T>, leaf: u256): u256 {
 Inserting leaves sequentially:
 
 **After inserting L0 (index 0)**:
-```
+```text
 filled_subtrees[0] = L0
 filled_subtrees[1] = Poseidon(L0, Z0)
 filled_subtrees[2] = Poseidon(Poseidon(L0, Z0), Z1)
@@ -136,7 +136,7 @@ filled_subtrees[2] = Poseidon(Poseidon(L0, Z0), Z1)
 ```
 
 **After inserting L1 (index 1)**:
-```
+```text
 filled_subtrees[0] = L1  (updated)
 filled_subtrees[1] = Poseidon(L0, L1)  (updated)
 filled_subtrees[2] = Poseidon(Poseidon(L0, L1), Z1)  (updated)

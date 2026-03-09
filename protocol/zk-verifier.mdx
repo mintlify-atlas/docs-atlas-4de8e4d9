@@ -196,7 +196,7 @@ Verifies that a user's age meets a threshold without revealing their birthdate.
 - `intent_hash`: Intent hash to bind proof to transaction
 
 **Circuit Logic:**
-```
+```text
 1. Verify credential signature using government public key
 2. Recompute identity_commitment = Poseidon(credential_fields)
 3. Compute age = (current_date - birthdate) / 10000
@@ -216,7 +216,7 @@ Proves ownership of a valid government credential for meta-address registration.
 - `identity_commitment`: Poseidon(credential_fields)
 
 **Circuit Logic:**
-```
+```text
 1. Verify credential signature
 2. Recompute commitment = Poseidon(credential_fields)
 3. Output: [identity_commitment]
@@ -240,7 +240,7 @@ Proves ownership of a note in the shielded pool without revealing which note.
 - `change_commitment`: Commitment to change note (if partial withdrawal)
 
 **Circuit Logic:**
-```
+```text
 1. Compute commitment = Poseidon(amount, owner_key, salt)
 2. Verify merkle_path authenticates commitment to merkle_root
 3. Compute nullifier_check = Poseidon(commitment, owner_key)
@@ -366,12 +366,12 @@ console.log('On-chain verification:', result);
 ### Proof Structure
 
 A Groth16 proof consists of 3 points on the BN254 elliptic curve:
-```
+```text
 π = (A, B, C)
 ```
 
 Verification checks:
-```
+```text
 e(A, B) = e(α, β) · e(∑ pubInput_i · IC_i, γ) · e(C, δ)
 ```
 
